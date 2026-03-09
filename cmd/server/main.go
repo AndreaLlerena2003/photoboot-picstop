@@ -1,0 +1,37 @@
+// Package main is the composition root: wires layers via dependency injection (no logic).
+package main
+
+import (
+	"log"
+
+	"photoboot-picstop/config"
+	"photoboot-picstop/internal/application/capture"
+	"photoboot-picstop/internal/infrastructure/canon"
+	httppkg "photoboot-picstop/internal/presentation/http"
+)
+
+func main() {
+	cfg := config.Load()
+	log.Printf("initializing Canon service (capture_dir=%s)", cfg.CaptureDir)
+
+	// Infrastructure: camera port implementation (implements capture.ICameraCapturePort)
+	camera, err := canon.NewService(cfg.CaptureDir)
+	if err != nil {
+		log.Fatalf("failed to initialize Canon service: %v", err)
+	}
+	log.Printf("Canon service initialized")
+	defer func() {
+		if err := camera.Close(); err != nil {
+			log.Printf("close Canon service: %v", err)
+		}
+	}()
+
+	// Application: use case with port injected (DIP)
+	captureUseCase := capture.NewCapturePhotoUseCase(camera)
+
+	// Presentation: server with use case injected
+	srv := httppkg.NewServer(":"+cfg.Port, captureUseCase, cfg.DefaultCaptureTimeout())
+	if err := srv.Start(); err != nil {
+		log.Fatalf("server failed: %v", err)
+	}
+}

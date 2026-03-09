@@ -1,0 +1,25 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Debug photoboot-picstop" type="GoApplicationRunConfiguration" factoryName="Go Application">
+    <module name="photoboot-picstop" />
+    <working_directory value="$PROJECT_DIR$" />
+    <envs>
+      <env name="CGO_ENABLED" value="1" />
+      <env name="GOARCH" value="amd64" />
+      <env name="CC" value="C:\Users\aller\scoop\apps\gcc\current\bin\gcc.exe" />
+      <env name="PATH" value="$PROJECT_DIR$/edsdk;$PATH$" />
+      <env name="CAPTURE_DIR" value="captures" />
+      <env name="PORT" value="8080" />
+      <env name="CAPTURE_TIMEOUT_MS" value="120000" />
+      <env name="CANON_DISCOVERY_TIMEOUT_MS" value="60000" />
+      <env name="CANON_CONFIGURE_NO_FLASH" value="1" />
+      <env name="CANON_CAPTURE_PREEMPT_MS" value="1200" />
+      <env name="CANON_JOB_DRAIN_TIMEOUT_MS" value="4000" />
+      <env name="CANON_SHUTTER_COMMAND_TIMEOUT_MS" value="45000" />
+      <env name="CANON_SAVE_TIMEOUT_MS" value="8000" />
+    </envs>
+    <kind value="PACKAGE" />
+    <package value="photoboot-picstop/cmd/server" />
+    <directory value="$PROJECT_DIR$" />
+    <method v="2" />
+  </configuration>
+</component>
