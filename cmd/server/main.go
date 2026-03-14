@@ -6,6 +6,7 @@ import (
 
 	"photoboot-picstop/config"
 	"photoboot-picstop/internal/application/capture"
+	"photoboot-picstop/internal/application/preview"
 	"photoboot-picstop/internal/infrastructure/canon"
 	httppkg "photoboot-picstop/internal/presentation/http"
 )
@@ -26,11 +27,12 @@ func main() {
 		}
 	}()
 
-	// Application: use case with port injected (DIP)
+	// Application: use cases with ports injected (DIP)
 	captureUseCase := capture.NewCapturePhotoUseCase(camera)
+	previewUseCase := preview.NewStreamPreviewUseCase(camera)
 
-	// Presentation: server with use case injected
-	srv := httppkg.NewServer(":"+cfg.Port, captureUseCase, cfg.DefaultCaptureTimeout())
+	// Presentation: server with use cases injected
+	srv := httppkg.NewServer(":"+cfg.Port, captureUseCase, previewUseCase, cfg.DefaultCaptureTimeout())
 	if err := srv.Start(); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}

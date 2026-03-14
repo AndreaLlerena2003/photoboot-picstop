@@ -15,7 +15,7 @@ func NewCapturePhotoUseCase(camera ICameraCapturePort) *CapturePhotoUseCase {
 
 // Execute runs the use case: delegates to the camera port and maps the result to a response DTO.
 // Business rule: one capture at a time; preempt and job waiting are handled by the port implementation.
-func (u *CapturePhotoUseCase) Execute(ctx context.Context, req CapturePhotoRequest) (CapturePhotoResponse, error) {
+func (u *CapturePhotoUseCase) Execute(ctx context.Context) (CapturePhotoResponse, error) {
 	path, err := u.camera.Capture(ctx)
 	if err != nil {
 		return CapturePhotoResponse{Success: false}, err

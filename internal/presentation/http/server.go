@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"photoboot-picstop/internal/application/capture"
+	"photoboot-picstop/internal/application/preview"
 )
 
 // Server is the HTTP presentation server: routes and controllers only.
@@ -18,11 +20,20 @@ type Server struct {
 	srv *http.Server
 }
 
-// NewServer builds the server with capture route and controller (dependencies injected).
-func NewServer(addr string, captureUseCase *capture.CapturePhotoUseCase, defaultCaptureTimeout time.Duration) *Server {
-	ctrl := NewCaptureController(captureUseCase, defaultCaptureTimeout)
+// NewServer builds the server with capture and preview routes (dependencies injected).
+func NewServer(
+	addr string,
+	captureUseCase *capture.CapturePhotoUseCase,
+	previewUseCase *preview.StreamPreviewUseCase,
+	defaultCaptureTimeout time.Duration,
+) *Server {
+	captureCtrl := NewCaptureController(captureUseCase, defaultCaptureTimeout)
+	previewCtrl := NewPreviewController(previewUseCase)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/capture", ctrl.ServeHTTP)
+	mux.HandleFunc("/capture", captureCtrl.ServeHTTP)
+	mux.HandleFunc("/preview", previewCtrl.ServeHTTP)
+
 	return &Server{
 		srv: &http.Server{
 			Addr:              addr,
@@ -38,16 +49,21 @@ func (s *Server) Start() error {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
+	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("camera endpoint listening on http://localhost%s", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("server listen error: %v", err)
+			errCh <- err
 		}
 	}()
 
-	sig := <-stop
-	signal.Stop(stop)
-	log.Printf("shutdown signal received: %s", sig)
+	select {
+	case sig := <-stop:
+		signal.Stop(stop)
+		log.Printf("shutdown signal received: %s", sig)
+	case err := <-errCh:
+		return fmt.Errorf("server failed to start: %w", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

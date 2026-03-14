@@ -82,3 +82,31 @@ func flashConfigEnabled() bool {
 	v := strings.TrimSpace(strings.ToLower(os.Getenv("CANON_CONFIGURE_NO_FLASH")))
 	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
+
+// evfFrameInterval devuelve el intervalo entre capturas de frame EVF (env: CANON_EVF_FRAME_INTERVAL_MS).
+func evfFrameInterval() time.Duration {
+	const fallback = 33 * time.Millisecond // ~30 fps
+	raw := strings.TrimSpace(os.Getenv("CANON_EVF_FRAME_INTERVAL_MS"))
+	if raw == "" {
+		return fallback
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms < 10 || ms > 1000 {
+		return fallback
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// hostTransferTimeout devuelve el timeout para la descarga del archivo tras el disparo (env: CANON_HOST_TRANSFER_TIMEOUT_MS).
+func hostTransferTimeout() time.Duration {
+	const fallback = 15 * time.Second
+	raw := strings.TrimSpace(os.Getenv("CANON_HOST_TRANSFER_TIMEOUT_MS"))
+	if raw == "" {
+		return fallback
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms < 1000 || ms > 120000 {
+		return fallback
+	}
+	return time.Duration(ms) * time.Millisecond
+}

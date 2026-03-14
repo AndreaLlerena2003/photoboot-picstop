@@ -33,12 +33,15 @@ func (c *CaptureController) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req := c.buildRequest(r)
-	timeout := c.effectiveTimeout(req)
+	timeout, ok := c.parseTimeout(r)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, CapturePhotoViewModel{Error: "timeout_ms must be between 250 and 300000"})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
-	resp, err := c.useCase.Execute(ctx, req)
+	resp, err := c.useCase.Execute(ctx)
 	if err != nil {
 		writeJSON(w, domainErrToHTTPStatus(err), CapturePhotoViewModel{Error: err.Error()})
 		return
@@ -46,22 +49,18 @@ func (c *CaptureController) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, CapturePhotoViewModel{Success: resp.Success, Path: resp.Path})
 }
 
-// buildRequest maps HTTP query to CapturePhotoRequest (presentation -> application DTO).
-func (c *CaptureController) buildRequest(r *http.Request) capture.CapturePhotoRequest {
-	req := capture.CapturePhotoRequest{}
-	if raw := r.URL.Query().Get("timeout_ms"); raw != "" {
-		if ms, err := strconv.Atoi(raw); err == nil && ms >= 250 && ms <= 300000 {
-			req.TimeoutMs = ms
-		}
+// parseTimeout parses the optional timeout_ms query parameter.
+// Returns (timeout, true) on success, or (0, false) if the parameter is present but invalid.
+func (c *CaptureController) parseTimeout(r *http.Request) (time.Duration, bool) {
+	raw := r.URL.Query().Get("timeout_ms")
+	if raw == "" {
+		return c.defaultCaptureTimeout, true
 	}
-	return req
-}
-
-func (c *CaptureController) effectiveTimeout(req capture.CapturePhotoRequest) time.Duration {
-	if req.TimeoutMs > 0 {
-		return time.Duration(req.TimeoutMs) * time.Millisecond
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms < 250 || ms > 300000 {
+		return 0, false
 	}
-	return c.defaultCaptureTimeout
+	return time.Duration(ms) * time.Millisecond, true
 }
 
 // CapturePhotoViewModel is the JSON view model for capture responses (presentation layer).
