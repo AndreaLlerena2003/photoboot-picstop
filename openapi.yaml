@@ -1,0 +1,119 @@
+openapi: 3.0.3
+info:
+  title: Photoboot-Picstop API
+  description: |
+    API for controlling a Canon camera to capture photos and stream live preview.
+    Note: This API interacts with physical hardware and requires a Windows environment with the Canon EDSDK.
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+
+paths:
+  /capture:
+    post:
+      summary: Capture a photo
+      description: |
+        Triggers the camera shutter to take a photo. The request blocks until the photo is captured and transferred 
+        to the host machine. If a capture is already in progress, the behavior depends on the implementation (it may 
+        be superseded or rejected).
+      parameters:
+        - name: timeout_ms
+          in: query
+          description: Overall timeout for the capture and download process in milliseconds.
+          required: false
+          schema:
+            type: integer
+            minimum: 250
+            maximum: 300000
+            default: 60000
+      responses:
+        '200':
+          description: Photo captured and saved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaptureResponse'
+        '400':
+          description: Invalid timeout_ms parameter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '405':
+          description: Method not allowed. Use POST.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Conflict. A capture is already in progress or was superseded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '408':
+          description: Request timeout (context canceled).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '504':
+          description: Gateway timeout (shutter command or transfer timeout).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /preview:
+    get:
+      summary: Stream live preview
+      description: |
+        Streams MJPEG frames from the camera's Electronic Viewfinder (EVF). 
+        This endpoint uses `multipart/x-mixed-replace` to push JPEG frames to the client continuously.
+        Ideal for use in `<img src="/preview">` HTML tags.
+      responses:
+        '200':
+          description: Successfully started MJPEG stream.
+          content:
+            multipart/x-mixed-replace;boundary=mjpegframe:
+              schema:
+                type: string
+                format: binary
+        '405':
+          description: Method not allowed. Use GET.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Service unavailable. The camera is busy or EVF cannot be started.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    CaptureResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        path:
+          type: string
+          description: Absolute path to the saved photo on the host machine.
+          example: "C:\\Users\\arllk\\code\\photoboot-picstop\\captures\\IMG_0001.JPG"
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "capture in progress"
