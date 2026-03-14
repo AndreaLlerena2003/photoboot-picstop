@@ -1,7 +1,6 @@
-# Photoboot-Picstop
-
 [![Go Version](https://img.shields.io/github/go-mod/go-version/AndreaLlerena2003/photoboot-picstop)](https://golang.org)
-[![Platform](https://img.shields.io/badge/platform-windows-blue)](https://www.microsoft.com/windows)
+[![Platform: Windows](https://img.shields.io/badge/platform-windows-blue)](https://www.microsoft.com/windows)
+[![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey)](https://www.apple.com/macos)
 
 A high-performance backend service for Canon camera control, designed for photobooth applications. This service provides
 a RESTful API to capture photos and a real-time MJPEG stream for live preview, using the **Canon EDSDK**.
@@ -20,12 +19,24 @@ a RESTful API to capture photos and a real-time MJPEG stream for live preview, u
 
 ## 📋 Requirements
 
-This project is specialized for **Windows** environments and requires the following:
+This project supports **Windows** and **macOS** (Darwin) environments.
+
+### General Requirements
+
+- **Go**: Version 1.20+ with `CGO_ENABLED=1`.
+- **Canon EDSDK**: The Canon SDK files must be properly placed in the project directory.
+
+### Windows Specifics
 
 - **OS**: Windows 10/11.
-- **Go**: Version 1.20+ with `CGO_ENABLED=1`.
 - **Compiler**: GCC (e.g., via [Scoop](https://scoop.sh/): `scoop install mingw`) or MinGW-w64.
-- **Canon EDSDK**: The Canon SDK DLLs (`edsdk/EDSDK.dll` and `edsdk/EDSDK.lib`) must be present in the repository.
+- **SDK**: `edsdk/EDSDK.dll` and `edsdk/EDSDK.lib`.
+
+### macOS Specifics
+
+- **OS**: macOS 10.15+.
+- **Compiler**: Xcode Command Line Tools (`xcode-select --install`).
+- **SDK**: `EDSDK.framework` placed in the `libs` directory.
 
 ---
 
@@ -44,7 +55,7 @@ CAPTURE_DIR=captures
 
 ### 2. Build
 
-To build the executable, run:
+#### Windows
 
 ```powershell
 # Set CGo environment variables
@@ -53,6 +64,13 @@ $env:GOARCH="amd64"
 
 # Build the server
 go build -o server.exe ./cmd/server/...
+```
+
+#### macOS
+
+```bash
+# Build the server
+CGO_ENABLED=1 go build -o server ./cmd/server/...
 ```
 
 ### 3. Run

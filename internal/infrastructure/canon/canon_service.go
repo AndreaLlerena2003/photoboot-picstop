@@ -1,11 +1,11 @@
-//go:build windows && cgo
+//go:build (windows || darwin) && cgo
 
 package canon
 
 /*
 #cgo windows CFLAGS: -I${SRCDIR}/../../../edsdk
 #cgo windows LDFLAGS: -L${SRCDIR}/../../../edsdk -l:EDSDK.lib -lole32
-#include <windows.h>
+#cgo darwin CFLAGS: -I${SRCDIR}/../../../edsdk
 #include <stdbool.h>
 
 #ifndef _MSC_VER
@@ -21,14 +21,6 @@ package canon
 extern EdsError goObjectEventHandler(EdsObjectEvent inEvent, EdsBaseRef inRef, EdsVoid* inContext);
 extern EdsError goCameraStateEventHandler(EdsStateEvent inEvent, EdsUInt32 inParameter, EdsVoid* inContext);
 
-static HRESULT codexCoInitializeSTA(void) {
-    return CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-}
-
-static void codexCoUninitialize(void) {
-    CoUninitialize();
-}
-
 // getStreamData extracts the data pointer and byte length from a memory stream.
 static EdsError getStreamData(EdsStreamRef stream, void** outPtr, EdsUInt64* outLen) {
     EdsError err = EdsGetPointer(stream, (EdsVoid**)outPtr);
@@ -36,7 +28,7 @@ static EdsError getStreamData(EdsStreamRef stream, void** outPtr, EdsUInt64* out
     return EdsGetLength(stream, outLen);
 }
 
-// createFileStreamW wraps EdsCreateFileStream accepting a plain char* path.
+// createFileStreamW wraps EdsCreateFileStream.
 static EdsError createFileStreamW(const char* path, EdsFileCreateDisposition disp,
                                    EdsAccess access, EdsStreamRef* outStream) {
     return EdsCreateFileStream((const EdsChar*)path, disp, access, outStream);
@@ -51,7 +43,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -149,11 +140,11 @@ func NewService(outputDir string) (_ *Service, retErr error) {
 		return nil, fmt.Errorf("create capture dir: %w", err)
 	}
 
-	uninitCOM, err := initCOMForCurrentThread()
+	uninitThreading, err := initPlatformThreading()
 	if err != nil {
 		return nil, err
 	}
-	defer uninitCOM()
+	defer uninitThreading()
 
 	log.Printf("canon: calling EdsInitializeSDK")
 	if err := acquireSDK(); err != nil {
@@ -285,7 +276,7 @@ func (s *Service) capture(ctx context.Context) (captureResult, error) {
 		s.bgWg.Add(1)
 		go func() {
 			defer s.bgWg.Done()
-			_ = withCOMForEDSDK(func() error {
+			_ = withPlatformThreading(func() error {
 				resetShutterState(camera)
 				return nil
 			})
@@ -388,7 +379,7 @@ func sendTakePictureWithTimeout(camera C.EdsCameraRef, timeout time.Duration, wg
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		resultCh <- withCOMForEDSDK(func() error {
+		resultCh <- withPlatformThreading(func() error {
 			return sendTakePicture(camera)
 		})
 	}()
@@ -401,7 +392,7 @@ func sendTakePictureWithTimeout(camera C.EdsCameraRef, timeout time.Duration, wg
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = withCOMForEDSDK(func() error {
+			_ = withPlatformThreading(func() error {
 				_ = sendCameraCommandWithRetry(
 					camera,
 					C.kEdsCameraCommand_PressShutterButton,
@@ -621,9 +612,9 @@ func (s *Service) evfLoop(ctx context.Context, frameCh chan<- []byte, stop <-cha
 	defer close(done)
 	defer s.evfActive.Store(false)
 
-	uninitCOM, err := initCOMForCurrentThread()
+	uninitThreading, err := initPlatformThreading()
 	if err != nil {
-		log.Printf("canon: EVF loop COM init failed: %v", err)
+		log.Printf("canon: EVF loop threading init failed: %v", err)
 		close(frameCh)
 		s.mu.Lock()
 		s.evfFrameCh = nil
@@ -632,7 +623,7 @@ func (s *Service) evfLoop(ctx context.Context, frameCh chan<- []byte, stop <-cha
 		s.mu.Unlock()
 		return
 	}
-	defer uninitCOM()
+	defer uninitThreading()
 
 	camera := s.camera
 
@@ -1029,7 +1020,7 @@ func (s *Service) Close() error {
 		s.mu.Unlock()
 
 		var errs []error
-		if err := withCOMForEDSDK(func() error {
+		if err := withPlatformThreading(func() error {
 			var closeErr error
 			if !disconnected {
 				// Camera still connected: close the session gracefully.
@@ -1060,12 +1051,12 @@ func (s *Service) startEventPump() {
 	go func() {
 		defer close(s.eventPumpDone)
 
-		uninitCOM, err := initCOMForCurrentThread()
+		uninitThreading, err := initPlatformThreading()
 		if err != nil {
-			log.Printf("canon: event pump COM initialization failed: %v", err)
+			log.Printf("canon: event pump threading initialization failed: %v", err)
 			return
 		}
-		defer uninitCOM()
+		defer uninitThreading()
 
 		ticker := time.NewTicker(20 * time.Millisecond)
 		defer ticker.Stop()
@@ -1356,38 +1347,8 @@ func edsErrHint(code C.EdsError) string {
 	}
 }
 
-// ─────────────────────────────────────────────
-// COM / OS thread helpers
-// ─────────────────────────────────────────────
-
-// withCOMForEDSDK ejecuta fn en un hilo con COM inicializado (requerido por EDSDK).
-func withCOMForEDSDK(fn func() error) error {
-	uninitCOM, err := initCOMForCurrentThread()
-	if err != nil {
-		return err
-	}
-	defer uninitCOM()
-	return fn()
-}
-
-// initCOMForCurrentThread llama a CoInitializeEx(COINIT_APARTMENTTHREADED) en el hilo actual; devuelve un uninit.
-func initCOMForCurrentThread() (func(), error) {
-	runtime.LockOSThread()
-	hr := uint32(C.codexCoInitializeSTA())
-	switch hr {
-	case 0x00000000, 0x00000001: // S_OK / S_FALSE
-		return func() {
-			C.codexCoUninitialize()
-			runtime.UnlockOSThread()
-		}, nil
-	case 0x80010106: // RPC_E_CHANGED_MODE
-		runtime.UnlockOSThread()
-		return nil, fmt.Errorf("CoInitializeEx(COINIT_APARTMENTTHREADED) failed: RPC_E_CHANGED_MODE (0x%08X)", hr)
-	default:
-		runtime.UnlockOSThread()
-		return nil, fmt.Errorf("CoInitializeEx(COINIT_APARTMENTTHREADED) failed: 0x%08X", hr)
-	}
-}
+// withPlatformThreading is moved to threading_*.go
+// initPlatformThreading is moved to threading_*.go
 
 // releaseRef libera una referencia EDS con EdsRelease.
 func releaseRef(ref C.EdsBaseRef) {
