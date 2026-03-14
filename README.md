@@ -81,6 +81,25 @@ CGO_ENABLED=1 go build -o server ./cmd/server/...
 
 ---
 
+## 🌐 Web Integration
+
+The live preview is streamed using **MJPEG (Multipart JPEG)**, which is natively supported by all modern browsers. You
+can embed the camera feed directly into your frontend with a single line of HTML:
+
+```html
+<!-- Simple live preview implementation -->
+<img src="http://localhost:8080/preview" alt="Camera Feed">
+```
+
+### Premium Demo
+
+A complete, styled web interface is provided in [web/index.html](./web/index.html). Since the server now supports static
+file serving, you can access this demo directly at:
+
+- **URL**: [http://localhost:8080/](http://localhost:8080/)
+
+---
+
 ## 📡 API Reference
 
 The server exposes two primary endpoints:

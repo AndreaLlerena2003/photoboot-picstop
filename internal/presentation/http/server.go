@@ -34,6 +34,9 @@ func NewServer(
 	mux.HandleFunc("/capture", captureCtrl.ServeHTTP)
 	mux.HandleFunc("/preview", previewCtrl.ServeHTTP)
 
+	// Serve the web demo at the root or /index.html
+	mux.Handle("/", http.FileServer(http.Dir("web")))
+
 	return &Server{
 		srv: &http.Server{
 			Addr:              addr,

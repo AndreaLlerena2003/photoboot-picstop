@@ -10,13 +10,31 @@ servers:
     description: Local development server
 
 paths:
+  /:
+    get:
+      summary: Web Demo Interface
+      description: |
+        Serves the static HTML/CSS/JS demo interface from the `web/` directory. 
+        Provides a ready-to-use GUI for live preview and camera control.
+      responses:
+        '200':
+          description: OK. Returns the index.html file.
+          content:
+            text/html:
+              schema:
+                type: string
+
   /capture:
     post:
       summary: Capture a photo
       description: |
         Triggers the camera shutter to take a photo. The request blocks until the photo is captured and transferred 
-        to the host machine. If a capture is already in progress, the behavior depends on the implementation (it may 
-        be superseded or rejected).
+        to the host machine. 
+        
+        **Concurrency Behavior**:
+        - If a second capture request arrives while the first is in progress, the first request is **superseded** 
+          (canceled with a 409 Conflict) and the newer request takes priority.
+        - The EVF (preview) is automatically suspended during this operation.
       parameters:
         - name: timeout_ms
           in: query
@@ -47,7 +65,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: Conflict. A capture is already in progress or was superseded.
+          description: Conflict. The capture was superseded by a newer request.
           content:
             application/json:
               schema:
@@ -77,7 +95,10 @@ paths:
       description: |
         Streams MJPEG frames from the camera's Electronic Viewfinder (EVF). 
         This endpoint uses `multipart/x-mixed-replace` to push JPEG frames to the client continuously.
-        Ideal for use in `<img src="/preview">` HTML tags.
+        
+        **Browser Compatibility**:
+        Natively supported by all modern browsers. Use directly as the source for an image tag:
+        `<img src="/preview" alt="Live View">`.
       responses:
         '200':
           description: Successfully started MJPEG stream.
