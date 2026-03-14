@@ -29,6 +29,11 @@ func (s *Service) StartPreview(_ context.Context) (<-chan []byte, error) {
 // StopPreview no hace nada en el stub.
 func (s *Service) StopPreview() {}
 
+// Disconnected devuelve un canal que nunca se cierra en el stub (plataforma no soportada).
+func (s *Service) Disconnected() <-chan struct{} {
+	return make(chan struct{}) // never closed; stub never connects
+}
+
 // Close no hace nada en el stub.
 func (s *Service) Close() error {
 	return nil

@@ -63,6 +63,37 @@ import (
 // activeService guarda el Service actual para que los callbacks C puedan despachar eventos.
 var activeService atomic.Pointer[Service]
 
+// sdkMu / sdkRefs guard EdsInitializeSDK / EdsTerminateSDK so the SDK is initialised
+// exactly once across concurrent NewService calls and torn down only when the last
+// service is closed — enabling restart-without-process-restart.
+var (
+	sdkMu   sync.Mutex
+	sdkRefs int
+)
+
+// acquireSDK increments the SDK reference count and, on the first call, initialises EDSDK.
+func acquireSDK() error {
+	sdkMu.Lock()
+	defer sdkMu.Unlock()
+	if sdkRefs == 0 {
+		if err := edsCheck("EdsInitializeSDK", C.EdsInitializeSDK()); err != nil {
+			return err
+		}
+	}
+	sdkRefs++
+	return nil
+}
+
+// releaseSDK decrements the SDK reference count and terminates EDSDK when it reaches zero.
+func releaseSDK() {
+	sdkMu.Lock()
+	defer sdkMu.Unlock()
+	sdkRefs--
+	if sdkRefs == 0 {
+		_ = C.EdsTerminateSDK()
+	}
+}
+
 // Service implementa el puerto de cámara (CameraPort) usando Canon EDSDK en Windows.
 type Service struct {
 	mu        sync.Mutex
@@ -74,8 +105,14 @@ type Service struct {
 	outputDir              string
 	pending                *captureRequest
 	closed                 bool
+	cameraDisconnected     bool // set by onStateEvent(kEdsStateEvent_Shutdown); skips EdsCloseSession in Close()
 	jobBusy                atomic.Uint32
 	suppressTransfersUntil time.Time
+
+	// disconnectedCh is closed (exactly once) when kEdsStateEvent_Shutdown fires.
+	// ReconnectingService waits on this to know when to start a reconnect attempt.
+	disconnectedCh   chan struct{}
+	disconnectedOnce sync.Once
 
 	stopEventPump chan struct{}
 	eventPumpDone chan struct{}
@@ -119,13 +156,13 @@ func NewService(outputDir string) (_ *Service, retErr error) {
 	defer uninitCOM()
 
 	log.Printf("canon: calling EdsInitializeSDK")
-	if err := edsCheck("EdsInitializeSDK", C.EdsInitializeSDK()); err != nil {
+	if err := acquireSDK(); err != nil {
 		return nil, err
 	}
 	sdkInitialized := true
 	defer func() {
 		if retErr != nil && sdkInitialized {
-			_ = C.EdsTerminateSDK()
+			releaseSDK()
 		}
 	}()
 
@@ -166,11 +203,12 @@ func NewService(outputDir string) (_ *Service, retErr error) {
 	}()
 
 	svc := &Service{
-		camera:        camera,
-		outputDir:     absDir,
-		stopEventPump: make(chan struct{}),
-		eventPumpDone: make(chan struct{}),
-		jobStateCh:    make(chan struct{}, 1),
+		camera:         camera,
+		outputDir:      absDir,
+		stopEventPump:  make(chan struct{}),
+		eventPumpDone:  make(chan struct{}),
+		jobStateCh:     make(chan struct{}, 1),
+		disconnectedCh: make(chan struct{}),
 	}
 	activeService.Store(svc)
 	defer func() {
@@ -872,22 +910,44 @@ func (s *Service) onObjectEvent(event C.EdsObjectEvent, ref C.EdsBaseRef) C.EdsE
 
 // onStateEvent handles camera state changes.
 // JobStatusChanged with inParameter==0 means the camera finished its current job.
+// Shutdown means the camera was physically disconnected.
 func (s *Service) onStateEvent(event C.EdsStateEvent, inParameter C.EdsUInt32) C.EdsError {
-	if event != C.kEdsStateEvent_JobStatusChanged {
-		return C.EDS_ERR_OK
-	}
+	switch event {
+	case C.kEdsStateEvent_Shutdown:
+		log.Printf("canon: camera shutdown event received (disconnection)")
 
-	if inParameter == 0 {
-		s.jobBusy.Store(0)
-		log.Printf("canon: camera job finished")
-	} else {
-		s.jobBusy.Store(1)
-		log.Printf("canon: camera job started")
-	}
+		s.mu.Lock()
+		s.closed = true
+		s.cameraDisconnected = true
+		pending := s.pending
+		s.pending = nil
+		// Cancel EVF context so evfLoop takes the ctx.Done() path, which closes
+		// frameCh and signals HTTP preview clients to stop cleanly.
+		evfCancel := s.evfCancel
+		s.mu.Unlock()
 
-	select {
-	case s.jobStateCh <- struct{}{}:
-	default:
+		if evfCancel != nil {
+			evfCancel()
+		}
+		if pending != nil {
+			notifyCaptureResult(pending, captureResult{err: domain.ErrCameraDisconnected})
+		}
+		activeService.CompareAndSwap(s, nil)
+		// Signal ReconnectingService (or any other waiter) that reconnect can begin.
+		s.disconnectedOnce.Do(func() { close(s.disconnectedCh) })
+
+	case C.kEdsStateEvent_JobStatusChanged:
+		if inParameter == 0 {
+			s.jobBusy.Store(0)
+			log.Printf("canon: camera job finished")
+		} else {
+			s.jobBusy.Store(1)
+			log.Printf("canon: camera job started")
+		}
+		select {
+		case s.jobStateCh <- struct{}{}:
+		default:
+		}
 	}
 	return C.EDS_ERR_OK
 }
@@ -964,12 +1024,21 @@ func (s *Service) Close() error {
 
 		s.bgWg.Wait()
 
+		s.mu.Lock()
+		disconnected := s.cameraDisconnected
+		s.mu.Unlock()
+
 		var errs []error
 		if err := withCOMForEDSDK(func() error {
-			closeErr := edsCheck("EdsCloseSession", C.EdsCloseSession(camera))
-			releaseRef(C.EdsBaseRef(camera))
-			terminateErr := edsCheck("EdsTerminateSDK", C.EdsTerminateSDK())
-			return errors.Join(closeErr, terminateErr)
+			var closeErr error
+			if !disconnected {
+				// Camera still connected: close the session gracefully.
+				closeErr = edsCheck("EdsCloseSession", C.EdsCloseSession(camera))
+				releaseRef(C.EdsBaseRef(camera))
+			}
+			// Decrement SDK ref count; terminates EDSDK when it reaches zero.
+			releaseSDK()
+			return closeErr
 		}); err != nil {
 			errs = append(errs, err)
 		}
@@ -978,6 +1047,12 @@ func (s *Service) Close() error {
 		}
 	})
 	return s.closeErr
+}
+
+// Disconnected returns a channel that is closed when the camera fires a shutdown event
+// (USB unplugged). Callers can select on it to detect disconnection without polling.
+func (s *Service) Disconnected() <-chan struct{} {
+	return s.disconnectedCh
 }
 
 // startEventPump ejecuta EdsGetEvent en un ticker para que los callbacks EDSDK se disparen.

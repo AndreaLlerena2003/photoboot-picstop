@@ -15,8 +15,9 @@ func main() {
 	cfg := config.Load()
 	log.Printf("initializing Canon service (capture_dir=%s)", cfg.CaptureDir)
 
-	// Infrastructure: camera port implementation (implements capture.ICameraCapturePort)
-	camera, err := canon.NewService(cfg.CaptureDir)
+	// Infrastructure: self-reconnecting camera service (implements ICameraCapturePort + IPreviewPort).
+	// Automatically discovers and reconnects to the camera when replugged — no restart needed.
+	camera, err := canon.NewReconnectingService(cfg.CaptureDir)
 	if err != nil {
 		log.Fatalf("failed to initialize Canon service: %v", err)
 	}

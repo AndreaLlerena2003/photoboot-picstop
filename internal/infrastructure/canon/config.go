@@ -83,6 +83,34 @@ func flashConfigEnabled() bool {
 	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
+// reconnectInitialDelay devuelve el tiempo de espera antes del primer intento de reconexión (env: CANON_RECONNECT_INITIAL_MS).
+func reconnectInitialDelay() time.Duration {
+	const fallback = 3 * time.Second
+	raw := strings.TrimSpace(os.Getenv("CANON_RECONNECT_INITIAL_MS"))
+	if raw == "" {
+		return fallback
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms < 500 || ms > 60000 {
+		return fallback
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// reconnectMaxDelay devuelve el tiempo máximo de espera entre reintentos de reconexión (env: CANON_RECONNECT_MAX_MS).
+func reconnectMaxDelay() time.Duration {
+	const fallback = 30 * time.Second
+	raw := strings.TrimSpace(os.Getenv("CANON_RECONNECT_MAX_MS"))
+	if raw == "" {
+		return fallback
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms < 1000 || ms > 300000 {
+		return fallback
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 // evfFrameInterval devuelve el intervalo entre capturas de frame EVF (env: CANON_EVF_FRAME_INTERVAL_MS).
 func evfFrameInterval() time.Duration {
 	const fallback = 33 * time.Millisecond // ~30 fps

@@ -13,4 +13,6 @@ var (
 	ErrUnsupported = errors.New("Canon EDSDK requires Windows with cgo enabled")
 	// ErrPreviewUnavailable indica que el live preview no está disponible (cámara ocupada o no soportado).
 	ErrPreviewUnavailable = errors.New("live preview unavailable")
+	// ErrCameraDisconnected indica que la cámara fue desconectada físicamente durante la operación.
+	ErrCameraDisconnected = errors.New("camera was disconnected")
 )
