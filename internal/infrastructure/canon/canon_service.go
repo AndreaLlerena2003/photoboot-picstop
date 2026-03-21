@@ -242,6 +242,11 @@ func (s *Service) runSDKThread(initDone chan<- error) {
 	}
 	cInfo("[init] state event handler registered")
 
+	// Unlock the restricted ContinuousAfMode property before opening the session.
+	// The EDSDK requires this specific pre-session unlock sequence or the property
+	// will be rejected after the session is open.
+	unlockContinuousAF(camera)
+
 	if err := openSessionWithRetry(camera); err != nil {
 		releaseRef(cameraBase)
 		releaseSDK()
@@ -872,13 +877,32 @@ func startEVFMode(camera C.EdsCameraRef) error {
 		return err
 	}
 	device |= C.kEdsEvfOutputDevice_PC
-	return edsCheck("EdsSetPropertyData(Evf_OutputDevice)",
+	if err := edsCheck("EdsSetPropertyData(Evf_OutputDevice)",
 		C.EdsSetPropertyData(
 			C.EdsBaseRef(camera),
 			C.kEdsPropID_Evf_OutputDevice, 0,
 			C.EdsUInt32(unsafe.Sizeof(device)),
 			unsafe.Pointer(&device),
-		))
+		)); err != nil {
+		return err
+	}
+
+	// Enable continuous AF now that live view is streaming to the PC.
+	// The property was pre-unlocked in unlockContinuousAF() before the session opened.
+	enableAF := C.EdsUInt32(1)
+	if err := edsCheck("EdsSetPropertyData(ContinuousAfMode=1)",
+		C.EdsSetPropertyData(
+			C.EdsBaseRef(camera),
+			C.EdsPropertyID(0x01000433), // kEdsPropID_ContinuousAfMode
+			0,
+			C.EdsUInt32(unsafe.Sizeof(enableAF)),
+			unsafe.Pointer(&enableAF),
+		)); err != nil {
+		cWarn("[evf] ContinuousAfMode=1 failed (non-fatal, camera may not support it): %v", err)
+	} else {
+		cInfo("[evf] ContinuousAfMode enabled")
+	}
+	return nil
 }
 
 // stopEVFMode removes the PC flag from Evf_OutputDevice, ending live view to PC.
@@ -1245,6 +1269,25 @@ func edsStateEventName(event C.EdsStateEvent) string {
 // ─────────────────────────────────────────────
 // Camera configuration
 // ─────────────────────────────────────────────
+
+// unlockContinuousAF unlocks the restricted kEdsPropID_ContinuousAfMode (0x01000433)
+// property using the SDK-level unlock sequence documented in the EDSDK reference.
+// Must be called BEFORE EdsOpenSession — the property cannot be unlocked afterwards.
+func unlockContinuousAF(camera C.EdsCameraRef) {
+	propID := C.EdsUInt32(0x01000433) // kEdsPropID_ContinuousAfMode
+	if err := edsCheck("EdsSetPropertyData(ContinuousAfMode unlock)",
+		C.EdsSetPropertyData(
+			C.EdsBaseRef(camera),
+			C.EdsPropertyID(0x01000000), // SDK-level unlock property ID
+			C.EdsInt32(0x32F87FF6),      // authorization key
+			C.EdsUInt32(unsafe.Sizeof(propID)),
+			unsafe.Pointer(&propID),
+		)); err != nil {
+		cWarn("[init] ContinuousAF property unlock failed: %v — preview AF will not be available", err)
+	} else {
+		cInfo("[init] ContinuousAF property unlocked")
+	}
+}
 
 // configureCamera sets SaveTo=Camera (photo written to SD card) and optionally
 // disables flash. With SaveTo=Camera, no EdsSetCapacity is needed and no
