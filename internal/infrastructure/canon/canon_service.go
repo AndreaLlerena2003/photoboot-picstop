@@ -40,7 +40,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -155,10 +154,10 @@ func NewService(outputDir string) (_ *Service, retErr error) {
 	}
 	defer uninitThreading()
 
-	log.Printf("canon: calling EdsInitializeSDK")
 	if err := acquireSDK(); err != nil {
 		return nil, err
 	}
+	cInfo("[init] SDK initialized")
 	sdkInitialized := true
 	defer func() {
 		if retErr != nil && sdkInitialized {
@@ -167,7 +166,7 @@ func NewService(outputDir string) (_ *Service, retErr error) {
 	}()
 
 	discoveryTimeout := cameraDiscoveryTimeout()
-	log.Printf("canon: discovering camera (timeout=%s)", discoveryTimeout)
+	cInfo("[init] discovering camera (timeout=%s)", discoveryTimeout)
 	cameraBase, err := waitForFirstCamera(discoveryTimeout)
 	if err != nil {
 		return nil, err
@@ -181,20 +180,20 @@ func NewService(outputDir string) (_ *Service, retErr error) {
 	}()
 
 	handler := (C.EdsObjectEventHandler)(C.goObjectEventHandler)
-	log.Printf("canon: registering object event handler")
 	if err := edsCheck("EdsSetObjectEventHandler", C.EdsSetObjectEventHandler(camera, C.kEdsObjectEvent_All, handler, nil)); err != nil {
 		return nil, err
 	}
+	cInfo("[init] object event handler registered")
 	stateHandler := (C.EdsStateEventHandler)(C.goCameraStateEventHandler)
-	log.Printf("canon: registering state event handler")
 	if err := edsCheck("EdsSetCameraStateEventHandler", C.EdsSetCameraStateEventHandler(camera, C.kEdsStateEvent_All, stateHandler, nil)); err != nil {
 		return nil, err
 	}
+	cInfo("[init] state event handler registered")
 
-	log.Printf("canon: opening camera session")
 	if err := openSessionWithRetry(camera); err != nil {
 		return nil, err
 	}
+	cInfo("[init] camera session opened")
 	sessionOpen := true
 	defer func() {
 		if retErr != nil && sessionOpen {
@@ -218,12 +217,12 @@ func NewService(outputDir string) (_ *Service, retErr error) {
 		}
 	}()
 
-	log.Printf("canon: configuring host capture defaults")
 	if err := configureCamera(camera); err != nil {
 		return nil, err
 	}
+	cInfo("[init] camera configured")
 
-	log.Printf("canon: starting event pump")
+	cInfo("[init] starting event pump")
 	svc.startEventPump()
 
 	sessionOpen = false
@@ -246,8 +245,9 @@ func (s *Service) Capture(ctx context.Context) (string, error) {
 }
 
 func (s *Service) capture(ctx context.Context) (captureResult, error) {
+	SetGoroutineRole("capture")
 	captureStart := time.Now()
-	log.Printf("canon: [capture] START — evfActive=%v evfSuspendedByCapture=%v jobBusy=%d",
+	cInfo("[capture] START — evfActive=%v evfSuspendedByCapture=%v jobBusy=%d",
 		s.evfActive.Load(), s.evfSuspendedByCapture.Load(), s.jobBusy.Load())
 
 	req := &captureRequest{
@@ -259,11 +259,11 @@ func (s *Service) capture(ctx context.Context) (captureResult, error) {
 	// EVF, so that maybeResumeEVF knows who should restart it.
 	if s.evfActive.Load() && !s.evfSuspendedByCapture.Swap(true) {
 		// We set evfSuspendedByCapture false→true: we own the suspend.
-		log.Printf("canon: [capture] suspending EVF before capture")
+		cInfo("[capture] suspending EVF before capture")
 		s.suspendEVF()
-		log.Printf("canon: [capture] EVF suspended (+%s)", time.Since(captureStart))
+		cInfo("[capture] EVF suspended (+%s)", time.Since(captureStart))
 	} else {
-		log.Printf("canon: [capture] EVF not active or already suspended, skipping suspend")
+		cDebug("[capture] EVF not active or already suspended, skipping suspend")
 	}
 
 	// ── Preempt any in-flight capture ──────────────────────────────────────
@@ -273,7 +273,7 @@ func (s *Service) capture(ctx context.Context) (captureResult, error) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		log.Printf("canon: [capture] ABORT — service is closed")
+		cWarn("[capture] ABORT — service is closed")
 		s.maybeResumeEVF()
 		return captureResult{}, errors.New("service is closed")
 	}
@@ -284,75 +284,76 @@ func (s *Service) capture(ctx context.Context) (captureResult, error) {
 		if preemptWindow > 0 {
 			s.suppressTransfersUntil = time.Now().Add(preemptWindow)
 		}
-		log.Printf("canon: [capture] preempting in-progress capture; suppressTransfersUntil=+%s", preemptWindow)
+		cInfo("[capture] preempting in-progress capture; suppressTransfersUntil=+%s", preemptWindow)
 	} else {
-		log.Printf("canon: [capture] no pending capture to preempt")
+		cDebug("[capture] no pending capture to preempt")
 	}
 	s.pending = req
-	log.Printf("canon: [capture] registered as pending request (+%s)", time.Since(captureStart))
+	cDebug("[capture] registered as pending request (+%s)", time.Since(captureStart))
 	s.mu.Unlock()
 
 	if preempted != nil {
 		notifyCaptureResult(preempted, captureResult{err: domain.ErrCaptureSuperseded})
 		s.bgWg.Add(1)
 		go func() {
+			SetGoroutineRole("preempt")
 			defer s.bgWg.Done()
 			s.resetShutterStateOnPump()
 		}()
 		if preemptWindow > 0 {
-			log.Printf("canon: [capture] sleeping for preempt window %s", preemptWindow)
+			cInfo("[capture] sleeping for preempt window %s", preemptWindow)
 			time.Sleep(preemptWindow)
 		}
 	}
 
 	// ── Wait for previous job to finish ────────────────────────────────────
 	drainTimeout := jobDrainTimeout()
-	log.Printf("canon: [capture] waiting for transfer jobs idle (jobBusy=%d timeout=%s) (+%s)",
+	cDebug("[capture] waiting for transfer jobs idle (jobBusy=%d timeout=%s) (+%s)",
 		s.jobBusy.Load(), drainTimeout, time.Since(captureStart))
 	idled := s.waitForTransferJobsIdle(drainTimeout)
-	log.Printf("canon: [capture] transfer jobs idle=%v jobBusy=%d (+%s)",
+	cDebug("[capture] transfer jobs idle=%v jobBusy=%d (+%s)",
 		idled, s.jobBusy.Load(), time.Since(captureStart))
 	if !idled {
-		log.Printf("canon: [capture] WARNING: transfer jobs still busy after %s; proceeding anyway", drainTimeout)
+		cWarn("[capture] transfer jobs still busy after %s; proceeding anyway", drainTimeout)
 	}
 
 	// ── Guard: check context deadline ──────────────────────────────────────
 	commandTimeout := effectiveShutterTimeout(ctx, shutterCommandTimeout())
-	log.Printf("canon: [capture] effective shutter command timeout=%s (+%s)", commandTimeout, time.Since(captureStart))
+	cDebug("[capture] effective shutter command timeout=%s (+%s)", commandTimeout, time.Since(captureStart))
 	if commandTimeout <= 0 {
-		log.Printf("canon: [capture] ABORT — context deadline already exceeded")
+		cWarn("[capture] ABORT — context deadline already exceeded")
 		s.clearPending(req)
 		s.maybeResumeEVF()
 		return captureResult{}, context.DeadlineExceeded
 	}
 
 	// ── Fire shutter ────────────────────────────────────────────────────────
-	log.Printf("canon: [capture] firing shutter (+%s)", time.Since(captureStart))
+	cInfo("[capture] firing shutter (+%s)", time.Since(captureStart))
 	if err := s.sendTakePictureWithTimeout(commandTimeout); err != nil {
-		log.Printf("canon: [capture] shutter FAILED: %v (+%s)", err, time.Since(captureStart))
+		cError("[capture] shutter FAILED: %v (+%s)", err, time.Since(captureStart))
 		s.clearPending(req)
 		s.maybeResumeEVF()
 		return captureResult{}, err
 	}
-	log.Printf("canon: [capture] shutter command SUCCESS — now waiting for DirItemRequestTransfer event (+%s)", time.Since(captureStart))
+	cInfo("[capture] shutter command SUCCESS — now waiting for DirItemRequestTransfer event (+%s)", time.Since(captureStart))
 
 	// ── Wait for onObjectEvent to deliver the downloaded file ──────────────
 	// DirItemRequestTransfer → onObjectEvent → EdsDownload → notifyCaptureResult.
 	transferDeadline := hostTransferTimeout()
-	log.Printf("canon: [capture] host transfer timeout=%s", transferDeadline)
+	cDebug("[capture] host transfer timeout=%s", transferDeadline)
 	select {
 	case result := <-req.done:
-		log.Printf("canon: [capture] COMPLETE — path=%q err=%v elapsed=%s",
+		cInfo("[capture] COMPLETE — path=%q err=%v elapsed=%s",
 			result.path, result.err, time.Since(captureStart))
 		s.maybeResumeEVF()
 		return result, nil
 	case <-time.After(transferDeadline):
-		log.Printf("canon: [capture] TIMEOUT waiting for DirItemRequestTransfer after %s — shutter fired but no transfer event received; check SaveTo mode and SD card", transferDeadline)
+		cError("[capture] TIMEOUT waiting for DirItemRequestTransfer after %s — shutter fired but no transfer event received; check SaveTo mode and SD card", transferDeadline)
 		s.clearPending(req)
 		s.maybeResumeEVF()
 		return captureResult{}, fmt.Errorf("host transfer timed out after %s", transferDeadline)
 	case <-ctx.Done():
-		log.Printf("canon: [capture] context cancelled while waiting for transfer: %v (+%s)", ctx.Err(), time.Since(captureStart))
+		cWarn("[capture] context cancelled while waiting for transfer: %v (+%s)", ctx.Err(), time.Since(captureStart))
 		s.clearPending(req)
 		s.maybeResumeEVF()
 		return captureResult{}, ctx.Err()
@@ -363,51 +364,93 @@ func (s *Service) capture(ctx context.Context) (captureResult, error) {
 // Shutter commands
 // ─────────────────────────────────────────────
 
-// sendTakePicture dispatches TakePicture (and NonAF fallback) to the event pump
-// goroutine. Each EdsSendCommand is run on the pump's OS thread to avoid the
-// EDSDK internal lock deadlock that occurs when EdsSendCommand and EdsGetEvent
-// run concurrently on separate threads.
+// sendTakePicture acquires the camera UI lock (EDSDK §2.7), fires the shutter
+// via PressShutterButton, then releases the lock unconditionally.
+//
+// UI lock prevents the camera body's own UI from interfering with remote
+// commands. A missing lock can cause kEdsCameraCommand_PressShutterButton to
+// return EDS_ERR_DEVICE_BUSY even when the camera appears idle.
+//
+// Shutter strategy: try ShutterButton_Completely (with AF) first; fall back to
+// ShutterButton_Completely_NonAF if the camera reports an AF/busy error.
 func (s *Service) sendTakePicture() error {
-	log.Printf("canon: [shutter] trying EdsSendCommand(TakePicture) via pump (up to 6 attempts)")
-	takePictureCode := s.sendCameraCommandOnPump(
-		C.kEdsCameraCommand_TakePicture,
-		C.EdsInt32(0),
-		6,
-		180*time.Millisecond,
+	// ── UI Lock (EDSDK §2.7) ────────────────────────────────────────────────
+	// Lock the camera UI before any remote shutter command. Failures here are
+	// logged but do not abort the capture — the shutter attempt proceeds and
+	// the unlock is always sent to leave the camera in a clean state.
+	uiLocked := s.uiLock()
+	defer s.uiUnlock(uiLocked)
+
+	// ── Primary path: ShutterButton_Completely (AF enabled) ─────────────────
+	cInfo("[shutter] pressing ShutterButton_Completely via pump (uiLocked=%v)", uiLocked)
+	pressCode, releaseCode := s.pressAndReleaseShutter(
+		C.EdsInt32(C.kEdsCameraCommand_ShutterButton_Completely),
 	)
-	if takePictureCode == C.EDS_ERR_OK {
-		log.Printf("canon: [shutter] TakePicture accepted by camera (EDS_ERR_OK)")
+	cDebug("[shutter] ShutterButton_Completely press=%s (0x%08X) release=%s (0x%08X)",
+		edsErrName(pressCode), uint32(pressCode),
+		edsErrName(releaseCode), uint32(releaseCode))
+
+	if pressCode == C.EDS_ERR_OK {
+		if releaseCode != C.EDS_ERR_OK {
+			return edsCheck("EdsSendCommand(ShutterButton_OFF after Completely)", releaseCode)
+		}
+		cInfo("[shutter] ShutterButton_Completely succeeded — waiting for transfer event")
 		return nil
 	}
 
-	log.Printf("canon: [shutter] TakePicture returned: %s (0x%08X)", edsErrName(takePictureCode), uint32(takePictureCode))
-
-	// AF failed — fall back to NonAF shutter.
-	if takePictureCode != C.EDS_ERR_TAKE_PICTURE_AF_NG {
-		return edsCheck("EdsSendCommand(TakePicture)", takePictureCode)
-	}
-
-	log.Printf("canon: [shutter] AF not confirmed; retrying with NonAF shutter (ShutterButton_Completely_NonAF)")
+	// ── Fallback: ShutterButton_Completely_NonAF ────────────────────────────
+	cWarn("[shutter] ShutterButton_Completely failed (%s); retrying with NonAF", edsErrName(pressCode))
 	nonAFPressCode, nonAFReleaseCode := s.pressAndReleaseShutter(
 		C.EdsInt32(C.kEdsCameraCommand_ShutterButton_Completely_NonAF),
 	)
-	log.Printf("canon: [shutter] NonAF press=%s (0x%08X) release=%s (0x%08X)",
+	cDebug("[shutter] ShutterButton_NonAF press=%s (0x%08X) release=%s (0x%08X)",
 		edsErrName(nonAFPressCode), uint32(nonAFPressCode),
 		edsErrName(nonAFReleaseCode), uint32(nonAFReleaseCode))
+
 	if nonAFPressCode == C.EDS_ERR_OK {
 		if nonAFReleaseCode != C.EDS_ERR_OK {
-			return edsCheck("EdsSendCommand(ShutterButton_OFF)", nonAFReleaseCode)
+			return edsCheck("EdsSendCommand(ShutterButton_OFF after NonAF)", nonAFReleaseCode)
 		}
+		cInfo("[shutter] ShutterButton_NonAF succeeded — waiting for transfer event")
 		return nil
 	}
 
-	afErr := edsCheck("EdsSendCommand(TakePicture)", takePictureCode)
+	pressErr := edsCheck("EdsSendCommand(ShutterButton_Completely)", pressCode)
 	nonAFErr := edsCheck("EdsSendCommand(ShutterButton_Completely_NonAF)", nonAFPressCode)
-	if nonAFReleaseCode != C.EDS_ERR_OK {
-		return fmt.Errorf("%w; non-AF fallback failed: %v; release failed: %v",
-			afErr, nonAFErr, edsCheck("EdsSendCommand(ShutterButton_OFF)", nonAFReleaseCode))
+	return fmt.Errorf("%w; NonAF also failed: %v", pressErr, nonAFErr)
+}
+
+// uiLock sends kEdsCameraStatusCommand_UILock via the pump (EDSDK §2.7).
+// Returns true if the lock was acquired; callers must always call uiUnlock(locked).
+func (s *Service) uiLock() bool {
+	camera := s.camera
+	code := s.execOnPump(func() C.EdsError {
+		return C.EdsSendStatusCommand(camera, C.kEdsCameraStatusCommand_UILock, 0)
+	})
+	if code == C.EDS_ERR_OK {
+		cInfo("[shutter] UI lock acquired")
+		return true
 	}
-	return fmt.Errorf("%w; non-AF fallback failed: %v", afErr, nonAFErr)
+	cWarn("[shutter] UILock failed (%s 0x%08X) — proceeding without lock", edsErrName(code), uint32(code))
+	return false
+}
+
+// uiUnlock sends kEdsCameraStatusCommand_UIUnlock via the pump.
+// Only sent if uiLock succeeded (locked==true). Always called via defer.
+func (s *Service) uiUnlock(locked bool) {
+	if !locked {
+		cDebug("[shutter] UIUnlock skipped (lock was not held)")
+		return
+	}
+	camera := s.camera
+	code := s.execOnPump(func() C.EdsError {
+		return C.EdsSendStatusCommand(camera, C.kEdsCameraStatusCommand_UIUnLock, 0)
+	})
+	if code == C.EDS_ERR_OK {
+		cInfo("[shutter] UI lock released")
+	} else {
+		cWarn("[shutter] UIUnlock failed (%s 0x%08X)", edsErrName(code), uint32(code))
+	}
 }
 
 // sendTakePictureWithTimeout fires the shutter with a timeout guard.
@@ -417,28 +460,30 @@ func (s *Service) sendTakePictureWithTimeout(timeout time.Duration) error {
 		return fmt.Errorf("%w after %s", domain.ErrShutterCommandTimeout, timeout)
 	}
 
-	log.Printf("canon: [shutter] sendTakePictureWithTimeout timeout=%s", timeout)
+	cInfo("[shutter] sendTakePictureWithTimeout timeout=%s", timeout)
 	resultCh := make(chan error, 1)
 	s.bgWg.Add(1)
 	go func() {
+		SetGoroutineRole("shutter")
 		defer s.bgWg.Done()
-		log.Printf("canon: [shutter] goroutine started: dispatching TakePicture to pump thread")
+		cDebug("[shutter] goroutine started: dispatching TakePicture to pump thread")
 		resultCh <- s.sendTakePicture()
 	}()
 
 	select {
 	case err := <-resultCh:
 		if err == nil {
-			log.Printf("canon: [shutter] shutter command returned OK")
+			cInfo("[shutter] shutter command returned OK")
 		} else {
-			log.Printf("canon: [shutter] shutter command returned error: %v", err)
+			cError("[shutter] shutter command returned error: %v", err)
 		}
 		return err
 	case <-time.After(timeout):
-		log.Printf("canon: [shutter] TIMEOUT after %s — shutter goroutine still running; sending ShutterButton_OFF to reset", timeout)
+		cError("[shutter] TIMEOUT after %s — shutter goroutine still running; sending ShutterButton_OFF to reset", timeout)
 		// Best-effort reset on pump thread.
 		s.bgWg.Add(1)
 		go func() {
+			SetGoroutineRole("reset")
 			defer s.bgWg.Done()
 			s.resetShutterStateOnPump()
 		}()
@@ -487,25 +532,25 @@ func (s *Service) sendCameraCommandOnPump(
 	}
 	cmdName := edsCameraCommandName(command, param)
 	camera := s.camera
-	log.Printf("canon: [cmd] dispatching EdsSendCommand(%s) to pump — up to %d attempt(s)", cmdName, attempts)
+	cDebug("[cmd] dispatching EdsSendCommand(%s) to pump — up to %d attempt(s)", cmdName, attempts)
 	var code C.EdsError
 	for i := 0; i < attempts; i++ {
 		code = s.execOnPump(func() C.EdsError {
 			return C.EdsSendCommand(camera, command, param)
 		})
-		log.Printf("canon: [cmd] EdsSendCommand(%s) attempt %d/%d → %s (0x%08X)",
+		cDebug("[cmd] EdsSendCommand(%s) attempt %d/%d → %s (0x%08X)",
 			cmdName, i+1, attempts, edsErrName(code), uint32(code))
 		if code == C.EDS_ERR_OK {
 			return code
 		}
 		if !isRetryableCommandErr(code) {
-			log.Printf("canon: [cmd] non-retryable error on %s, stopping retries", cmdName)
+			cWarn("[cmd] non-retryable error on %s, stopping retries", cmdName)
 			return code
 		}
 		// Sleep in caller goroutine — pump keeps calling EdsGetEvent between retries.
 		time.Sleep(delay)
 	}
-	log.Printf("canon: [cmd] all %d attempt(s) exhausted for %s", attempts, cmdName)
+	cWarn("[cmd] all %d attempt(s) exhausted for %s", attempts, cmdName)
 	return code
 }
 
@@ -521,7 +566,7 @@ func edsCameraCommandName(command C.EdsCameraCommand, param C.EdsInt32) string {
 		case uint32(C.kEdsCameraCommand_ShutterButton_Completely_NonAF):
 			return "PressShutterButton(Completely_NonAF)"
 		case uint32(C.kEdsCameraCommand_ShutterButton_Completely):
-			return "PressShutterButton(Completely)"
+			return "PressShutterButton(Completely_AF)"
 		case uint32(C.kEdsCameraCommand_ShutterButton_Halfway):
 			return "PressShutterButton(Halfway)"
 		default:
@@ -679,13 +724,14 @@ func (s *Service) maybeResumeEVF() {
 // Exits when stop is closed (suspend for capture) or ctx is cancelled (client disconnected).
 // On ctx cancellation it closes frameCh to notify the HTTP handler.
 func (s *Service) evfLoop(ctx context.Context, frameCh chan<- []byte, stop <-chan struct{}, done chan<- struct{}) {
+	SetGoroutineRole("evf")
 	defer s.bgWg.Done()
 	defer close(done)
 	defer s.evfActive.Store(false)
 
 	uninitThreading, err := initPlatformThreading()
 	if err != nil {
-		log.Printf("canon: EVF loop threading init failed: %v", err)
+		cError("[evf] threading init failed: %v", err)
 		close(frameCh)
 		s.mu.Lock()
 		s.evfFrameCh = nil
@@ -699,7 +745,7 @@ func (s *Service) evfLoop(ctx context.Context, frameCh chan<- []byte, stop <-cha
 	camera := s.camera
 
 	if err := startEVFMode(camera); err != nil {
-		log.Printf("canon: failed to start EVF mode: %v", err)
+		cError("[evf] failed to start EVF mode: %v", err)
 		close(frameCh)
 		s.mu.Lock()
 		s.evfFrameCh = nil
@@ -708,7 +754,7 @@ func (s *Service) evfLoop(ctx context.Context, frameCh chan<- []byte, stop <-cha
 		s.mu.Unlock()
 		return
 	}
-	log.Printf("canon: EVF mode started")
+	cInfo("[evf] EVF mode started")
 
 	ticker := time.NewTicker(evfFrameInterval())
 	defer ticker.Stop()
@@ -718,13 +764,13 @@ func (s *Service) evfLoop(ctx context.Context, frameCh chan<- []byte, stop <-cha
 		case <-stop:
 			// Suspend for capture: stop EVF mode on camera but keep frameCh open.
 			stopEVFMode(camera)
-			log.Printf("canon: EVF suspended for capture")
+			cInfo("[evf] EVF suspended for capture")
 			return
 
 		case <-ctx.Done():
 			// Client disconnected: stop EVF and close the channel.
 			stopEVFMode(camera)
-			log.Printf("canon: EVF stopped (client disconnected)")
+			cInfo("[evf] EVF stopped (client disconnected)")
 			close(frameCh)
 			s.mu.Lock()
 			s.evfFrameCh = nil
@@ -742,7 +788,7 @@ func (s *Service) evfLoop(ctx context.Context, frameCh chan<- []byte, stop <-cha
 				if isRetryableEVFErr(err) {
 					continue // camera not ready yet; skip this frame
 				}
-				log.Printf("canon: EVF frame error: %v", err)
+				cWarn("[evf] frame error: %v", err)
 				continue
 			}
 			// Non-blocking send: drop frame if HTTP handler is slow.
@@ -886,7 +932,7 @@ func (s *Service) downloadDirectoryItem(dirItem C.EdsDirectoryItemRef) (string, 
 	}
 
 	fileName := C.GoString(&info.szFileName[0])
-	log.Printf("canon: [download] DirItemInfo: filename=%q size=%d isFolder=%v",
+	cInfo("[download] DirItemInfo: filename=%q size=%d isFolder=%v",
 		fileName, uint64(info.size), info.isFolder != 0)
 	destPath := filepath.Join(s.outputDir, fileName)
 
@@ -894,6 +940,7 @@ func (s *Service) downloadDirectoryItem(dirItem C.EdsDirectoryItemRef) (string, 
 	defer C.free(unsafe.Pointer(cPath))
 
 	var stream C.EdsStreamRef
+	cDebug("[download] creating file stream at %s", destPath)
 	if err := edsCheck("EdsCreateFileStream",
 		C.createFileStreamW(
 			cPath,
@@ -901,27 +948,33 @@ func (s *Service) downloadDirectoryItem(dirItem C.EdsDirectoryItemRef) (string, 
 			C.kEdsAccess_ReadWrite,
 			&stream,
 		)); err != nil {
+		cError("[download] EdsCreateFileStream failed: %v", err)
 		_ = C.EdsDownloadCancel(dirItem)
 		releaseRef(C.EdsBaseRef(dirItem))
 		return "", fmt.Errorf("create file stream: %w", err)
 	}
 	defer releaseRef(C.EdsBaseRef(stream))
 
+	cDebug("[download] calling EdsDownload (size=%d bytes)", uint64(info.size))
 	if err := edsCheck("EdsDownload",
 		C.EdsDownload(dirItem, C.EdsUInt64(info.size), stream)); err != nil {
+		cError("[download] EdsDownload failed: %v", err)
 		_ = C.EdsDownloadCancel(dirItem)
 		releaseRef(C.EdsBaseRef(dirItem))
 		return "", fmt.Errorf("download: %w", err)
 	}
+	cDebug("[download] EdsDownload OK")
 
+	cDebug("[download] calling EdsDownloadComplete")
 	if err := edsCheck("EdsDownloadComplete",
 		C.EdsDownloadComplete(dirItem)); err != nil {
+		cError("[download] EdsDownloadComplete failed: %v", err)
 		releaseRef(C.EdsBaseRef(dirItem))
 		return "", fmt.Errorf("download complete: %w", err)
 	}
+	cInfo("[download] EdsDownloadComplete OK — file saved to %s", destPath)
 
 	releaseRef(C.EdsBaseRef(dirItem))
-	log.Printf("canon: downloaded image to %s", destPath)
 	return destPath, nil
 }
 
@@ -935,11 +988,11 @@ func (s *Service) downloadDirectoryItem(dirItem C.EdsDirectoryItemRef) (string, 
 // thread — exactly what EDSDK requires. We call EdsDownload directly here, as
 // shown in the EDSDK sample code (Section 6.3).
 func (s *Service) onObjectEvent(event C.EdsObjectEvent, ref C.EdsBaseRef) C.EdsError {
-	log.Printf("canon: [event] onObjectEvent: event=%s (0x%08X) ref=%v",
+	cDebug("[event] onObjectEvent: event=%s (0x%08X) ref=%v",
 		edsObjectEventName(event), uint32(event), ref != nil)
 
 	if ref == nil {
-		log.Printf("canon: [event] ref is nil, ignoring event")
+		cWarn("[event] ref is nil, ignoring event")
 		return C.EDS_ERR_OK
 	}
 
@@ -948,10 +1001,10 @@ func (s *Service) onObjectEvent(event C.EdsObjectEvent, ref C.EdsBaseRef) C.EdsE
 
 		dirItem := C.EdsDirectoryItemRef(ref)
 		suppressed := s.isTransferSuppressed()
-		log.Printf("canon: [event] DirItemRequestTransfer received — isTransferSuppressed=%v", suppressed)
+		cInfo("[event] DirItemRequestTransfer received — isTransferSuppressed=%v", suppressed)
 
 		if suppressed {
-			log.Printf("canon: [event] suppressing stale transfer request (suppressTransfersUntil window active)")
+			cWarn("[event] suppressing stale transfer request (suppressTransfersUntil window active)")
 			_ = C.EdsDownloadCancel(dirItem)
 			releaseRef(ref)
 			return C.EDS_ERR_OK
@@ -960,11 +1013,11 @@ func (s *Service) onObjectEvent(event C.EdsObjectEvent, ref C.EdsBaseRef) C.EdsE
 		s.mu.Lock()
 		hasPending := s.pending != nil
 		s.mu.Unlock()
-		log.Printf("canon: [event] hasPendingCapture=%v — starting download", hasPending)
+		cDebug("[event] hasPendingCapture=%v — starting download", hasPending)
 
 		// Download directly on this goroutine — no extra thread needed.
 		path, err := s.downloadDirectoryItem(dirItem)
-		log.Printf("canon: [event] download finished: path=%q err=%v", path, err)
+		cDebug("[event] download finished: path=%q err=%v", path, err)
 
 		s.mu.Lock()
 		req := s.pending
@@ -974,15 +1027,15 @@ func (s *Service) onObjectEvent(event C.EdsObjectEvent, ref C.EdsBaseRef) C.EdsE
 		s.mu.Unlock()
 
 		if req != nil {
-			log.Printf("canon: [event] notifying pending capture request with result")
+			cDebug("[event] notifying pending capture request with result")
 			notifyCaptureResult(req, captureResult{path: path, err: err})
 		} else if err == nil {
-			log.Printf("canon: [event] WARNING: download complete but NO pending request to notify (path=%s) — capture() may have already timed out", path)
+			cWarn("[event] download complete but NO pending request to notify (path=%s) — capture() may have already timed out", path)
 		}
 		return C.EDS_ERR_OK
 	}
 
-	log.Printf("canon: [event] unhandled object event — releasing ref")
+	cDebug("[event] unhandled object event — releasing ref")
 	releaseRef(ref)
 	return C.EDS_ERR_OK
 }
@@ -1025,12 +1078,12 @@ func edsObjectEventName(event C.EdsObjectEvent) string {
 // JobStatusChanged with inParameter==0 means the camera finished its current job.
 // Shutdown means the camera was physically disconnected.
 func (s *Service) onStateEvent(event C.EdsStateEvent, inParameter C.EdsUInt32) C.EdsError {
-	log.Printf("canon: [event] onStateEvent: event=%s (0x%08X) param=0x%08X",
+	cDebug("[event] onStateEvent: event=%s (0x%08X) param=0x%08X",
 		edsStateEventName(event), uint32(event), uint32(inParameter))
 
 	switch event {
 	case C.kEdsStateEvent_Shutdown:
-		log.Printf("canon: [event] camera SHUTDOWN — physical disconnection detected")
+		cInfo("[event] camera SHUTDOWN — physical disconnection detected")
 
 		s.mu.Lock()
 		s.closed = true
@@ -1046,7 +1099,7 @@ func (s *Service) onStateEvent(event C.EdsStateEvent, inParameter C.EdsUInt32) C
 			evfCancel()
 		}
 		if pending != nil {
-			log.Printf("canon: [event] notifying pending capture of disconnection")
+			cInfo("[event] notifying pending capture of disconnection")
 			notifyCaptureResult(pending, captureResult{err: domain.ErrCameraDisconnected})
 		}
 		activeService.CompareAndSwap(s, nil)
@@ -1056,10 +1109,10 @@ func (s *Service) onStateEvent(event C.EdsStateEvent, inParameter C.EdsUInt32) C
 	case C.kEdsStateEvent_JobStatusChanged:
 		if inParameter == 0 {
 			s.jobBusy.Store(0)
-			log.Printf("canon: [event] JobStatusChanged → job IDLE (param=0)")
+			cInfo("[event] JobStatusChanged → job IDLE (param=0)")
 		} else {
 			s.jobBusy.Store(1)
-			log.Printf("canon: [event] JobStatusChanged → job BUSY (param=%d)", inParameter)
+			cInfo("[event] JobStatusChanged → job BUSY (param=%d)", inParameter)
 		}
 		select {
 		case s.jobStateCh <- struct{}{}:
@@ -1067,7 +1120,7 @@ func (s *Service) onStateEvent(event C.EdsStateEvent, inParameter C.EdsUInt32) C
 		}
 
 	default:
-		log.Printf("canon: [event] unhandled state event: %s (0x%08X) param=0x%08X",
+		cDebug("[event] unhandled state event: %s (0x%08X) param=0x%08X",
 			edsStateEventName(event), uint32(event), uint32(inParameter))
 	}
 	return C.EDS_ERR_OK
@@ -1116,13 +1169,13 @@ func configureCamera(camera C.EdsCameraRef) error {
 		unsafe.Pointer(&saveToBeforeSet),
 	)
 	if readErr == C.EDS_ERR_OK {
-		log.Printf("canon: [config] SaveTo current value BEFORE set: %s (0x%08X)",
+		cInfo("[config] SaveTo current value BEFORE set: %s (0x%08X)",
 			saveToName(saveToBeforeSet), uint32(saveToBeforeSet))
 	} else {
-		log.Printf("canon: [config] could not read current SaveTo: %s (0x%08X)", edsErrName(readErr), uint32(readErr))
+		cWarn("[config] could not read current SaveTo: %s (0x%08X)", edsErrName(readErr), uint32(readErr))
 	}
 
-	log.Printf("canon: [config] setting SaveTo=Host (kEdsSaveTo_Host=0x%08X)", uint32(C.kEdsSaveTo_Host))
+	cInfo("[config] setting SaveTo=Host (kEdsSaveTo_Host=0x%08X)", uint32(C.kEdsSaveTo_Host))
 	saveTo := C.EdsUInt32(C.kEdsSaveTo_Host)
 	if err := edsCheck("EdsSetPropertyData(SaveTo)", C.EdsSetPropertyData(
 		C.EdsBaseRef(camera),
@@ -1131,7 +1184,7 @@ func configureCamera(camera C.EdsCameraRef) error {
 		C.EdsUInt32(unsafe.Sizeof(saveTo)),
 		unsafe.Pointer(&saveTo),
 	)); err != nil {
-		log.Printf("canon: [config] WARNING: SaveTo=Host not applied: %v", err)
+		cWarn("[config] SaveTo=Host not applied: %v", err)
 	} else {
 		// Read back to confirm it was applied.
 		var saveToAfterSet C.EdsUInt32
@@ -1143,34 +1196,34 @@ func configureCamera(camera C.EdsCameraRef) error {
 			unsafe.Pointer(&saveToAfterSet),
 		)
 		if readBackErr == C.EDS_ERR_OK {
-			log.Printf("canon: [config] SaveTo AFTER set: %s (0x%08X) — expected Host (0x%08X)",
+			cInfo("[config] SaveTo AFTER set: %s (0x%08X) — expected Host (0x%08X)",
 				saveToName(saveToAfterSet), uint32(saveToAfterSet), uint32(C.kEdsSaveTo_Host))
 			if saveToAfterSet != C.EdsUInt32(C.kEdsSaveTo_Host) {
-				log.Printf("canon: [config] WARNING: SaveTo readback mismatch! Camera may save to SD card instead of host — DirItemRequestTransfer will NOT fire")
+				cWarn("[config] SaveTo readback mismatch! Camera may save to SD card instead of host — DirItemRequestTransfer will NOT fire")
 			}
 		} else {
-			log.Printf("canon: [config] SaveTo=Host set returned OK but readback failed: %s (0x%08X)", edsErrName(readBackErr), uint32(readBackErr))
+			cWarn("[config] SaveTo=Host set returned OK but readback failed: %s (0x%08X)", edsErrName(readBackErr), uint32(readBackErr))
 		}
 	}
 
 	// EdsSetCapacity is required for SaveTo=Host or the camera may report busy.
-	log.Printf("canon: [config] setting EdsSetCapacity (required for SaveTo=Host)")
+	cInfo("[config] setting EdsSetCapacity (required for SaveTo=Host)")
 	cap := C.EdsCapacity{
 		numberOfFreeClusters: C.EdsInt32(0x7FFFFFFF),
 		bytesPerSector:       C.EdsInt32(0x1000),
 		reset:                C.EdsBool(1),
 	}
 	if err := edsCheck("EdsSetCapacity", C.EdsSetCapacity(camera, cap)); err != nil {
-		log.Printf("canon: [config] WARNING: EdsSetCapacity failed: %v — host transfer may fail", err)
+		cWarn("[config] EdsSetCapacity failed: %v — host transfer may fail", err)
 	} else {
-		log.Printf("canon: [config] EdsSetCapacity OK")
+		cInfo("[config] EdsSetCapacity OK")
 	}
 
 	if !flashConfigEnabled() {
-		log.Printf("canon: [config] no-flash config skipped (set CANON_CONFIGURE_NO_FLASH=1 to enable)")
+		cDebug("[config] no-flash config skipped (set CANON_CONFIGURE_NO_FLASH=1 to enable)")
 		return nil
 	}
-	log.Printf("canon: [config] applying no-flash config")
+	cInfo("[config] applying no-flash config")
 	return configureNoFlash(camera)
 }
 
@@ -1200,6 +1253,7 @@ func configureNoFlash(camera C.EdsCameraRef) error {
 // Close detiene el event pump, notifica captura pendiente como cancelada y cierra sesión/SDK.
 func (s *Service) Close() error {
 	s.closeOnce.Do(func() {
+		cInfo("[close] Service.Close called")
 		activeService.CompareAndSwap(s, nil)
 
 		// Stop EVF first so the camera gets the stop command before the session closes.
@@ -1242,6 +1296,7 @@ func (s *Service) Close() error {
 		if len(errs) > 0 {
 			s.closeErr = errors.Join(errs...)
 		}
+		cInfo("[close] Service.Close complete err=%v", s.closeErr)
 	})
 	return s.closeErr
 }
@@ -1258,17 +1313,20 @@ func (s *Service) Disconnected() <-chan struct{} {
 // single OS thread to avoid internal EDSDK lock deadlocks.
 func (s *Service) startEventPump() {
 	go func() {
+		SetGoroutineRole("pump")
 		defer close(s.eventPumpDone)
 
 		uninitThreading, err := initPlatformThreading()
 		if err != nil {
-			log.Printf("canon: event pump threading initialization failed: %v", err)
+			cError("[pump] threading initialization failed: %v", err)
 			return
 		}
 		defer uninitThreading()
 
 		ticker := time.NewTicker(20 * time.Millisecond)
 		defer ticker.Stop()
+
+		var pumpCalls uint64
 
 		for {
 			select {
@@ -1280,13 +1338,20 @@ func (s *Service) startEventPump() {
 				// While this runs, EdsGetEvent is NOT called — that's intentional:
 				// EdsSendCommand holds the EDSDK internal lock so EdsGetEvent would
 				// block anyway. After the command returns, the ticker resumes pumping.
-				log.Printf("canon: [pump] executing task on pump thread")
+				cDebug("[pump] executing task on pump thread")
 				code := task.fn()
-				log.Printf("canon: [pump] task complete: %s (0x%08X)", edsErrName(code), uint32(code))
+				cDebug("[pump] task complete: %s (0x%08X)", edsErrName(code), uint32(code))
 				task.result <- code
 
 			case <-ticker.C:
-				_ = C.EdsGetEvent()
+				pumpCalls++
+				result := C.EdsGetEvent()
+				if pumpCalls%500 == 0 {
+					cDebug("[pump] heartbeat: %d EdsGetEvent calls", pumpCalls)
+				}
+				if result != C.EDS_ERR_OK {
+					cWarn("[pump] EdsGetEvent returned %s (0x%08X)", edsErrName(result), uint32(result))
+				}
 			}
 		}
 	}()
@@ -1300,7 +1365,7 @@ func (s *Service) execOnPump(fn func() C.EdsError) C.EdsError {
 	case s.pumpTaskCh <- task:
 		return <-task.result
 	case <-s.stopEventPump:
-		log.Printf("canon: [pump] execOnPump: pump stopped, returning internal error")
+		cWarn("[pump] execOnPump: pump stopped, returning internal error")
 		return C.EDS_ERR_INTERNAL_ERROR
 	}
 }
@@ -1324,13 +1389,13 @@ func waitForFirstCamera(timeout time.Duration) (C.EdsBaseRef, error) {
 		lastCount = count
 		if cameraRef != nil {
 			if attempt > 1 {
-				log.Printf("canon: camera discovered after %d attempts", attempt)
+				cInfo("[init] camera discovered after %d attempts", attempt)
 			}
 			return cameraRef, nil
 		}
 
 		if attempt == 1 || attempt%5 == 0 {
-			log.Printf("canon: waiting for camera (attempt=%d count=%d)", attempt, count)
+			cInfo("[init] waiting for camera (attempt=%d count=%d)", attempt, count)
 		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf(
@@ -1373,12 +1438,14 @@ func openSessionWithRetry(camera C.EdsCameraRef) error {
 	var last C.EdsError
 	for i := 0; i < attempts; i++ {
 		last = C.EdsOpenSession(camera)
+		cDebug("[session] EdsOpenSession attempt %d/%d → %s (0x%08X)", i+1, attempts, edsErrName(last), uint32(last))
 		if last == C.EDS_ERR_OK {
 			return nil
 		}
 		if last == C.EDS_ERR_DEVICE_BUSY ||
 			last == C.EDS_ERR_OBJECT_NOTREADY ||
 			last == C.EDS_ERR_COMM_PORT_IS_IN_USE {
+			cDebug("[session] retrying EdsOpenSession in 450ms (err=%s)", edsErrName(last))
 			time.Sleep(450 * time.Millisecond)
 			continue
 		}
@@ -1406,6 +1473,7 @@ func (s *Service) waitForTransferJobsIdle(timeout time.Duration) bool {
 	if s.jobBusy.Load() == 0 {
 		return true
 	}
+	cDebug("[drain] jobBusy=%d — waiting for job to become idle (timeout=%s)", s.jobBusy.Load(), timeout)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	for s.jobBusy.Load() != 0 {
@@ -1413,6 +1481,7 @@ func (s *Service) waitForTransferJobsIdle(timeout time.Duration) bool {
 		case <-timer.C:
 			return s.jobBusy.Load() == 0
 		case <-s.jobStateCh:
+			cDebug("[drain] jobStateCh signal received, jobBusy=%d", s.jobBusy.Load())
 		}
 	}
 	return true
@@ -1471,6 +1540,7 @@ func setOptionalUInt32Property(camera C.EdsCameraRef, label string, propID C.Eds
 			unsafe.Pointer(&value),
 		)
 		last = code
+		cDebug("[prop] EdsSetPropertyData(%s) attempt %d/5 → %s (0x%08X)", label, attempt+1, edsErrName(code), uint32(code))
 		if code == C.EDS_ERR_OK {
 			return nil
 		}
@@ -1610,6 +1680,7 @@ func releaseRef(ref C.EdsBaseRef) {
 func goObjectEventHandler(inEvent C.EdsObjectEvent, inRef C.EdsBaseRef, _ unsafe.Pointer) C.EdsError {
 	svc := activeService.Load()
 	if svc == nil {
+		cWarn("[event] goObjectEventHandler: activeService is nil, dropping event 0x%08X", uint32(inEvent))
 		releaseRef(inRef)
 		return C.EDS_ERR_OK
 	}
@@ -1620,6 +1691,7 @@ func goObjectEventHandler(inEvent C.EdsObjectEvent, inRef C.EdsBaseRef, _ unsafe
 func goCameraStateEventHandler(inEvent C.EdsStateEvent, inParameter C.EdsUInt32, _ unsafe.Pointer) C.EdsError {
 	svc := activeService.Load()
 	if svc == nil {
+		cWarn("[event] goCameraStateEventHandler: activeService is nil, dropping event 0x%08X", uint32(inEvent))
 		return C.EDS_ERR_OK
 	}
 	return svc.onStateEvent(inEvent, inParameter)

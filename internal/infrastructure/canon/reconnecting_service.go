@@ -2,7 +2,6 @@ package canon
 
 import (
 	"context"
-	"log"
 	"sync"
 	"time"
 
@@ -97,6 +96,7 @@ func (rs *ReconnectingService) Close() error {
 // ─────────────────────────────────────────────
 
 func (rs *ReconnectingService) reconnectLoop() {
+	SetGoroutineRole("reconnect")
 	defer rs.wg.Done()
 
 	for {
@@ -112,7 +112,7 @@ func (rs *ReconnectingService) reconnectLoop() {
 			case <-current.Disconnected():
 			}
 
-			log.Printf("canon: camera disconnected; will attempt reconnect")
+			cInfo("[reconnect] camera disconnected; will attempt reconnect")
 
 			// Nil out inner so callers get ErrCameraDisconnected while we reconnect.
 			rs.mu.Lock()
@@ -134,10 +134,10 @@ func (rs *ReconnectingService) reconnectLoop() {
 			case <-time.After(delay):
 			}
 
-			log.Printf("canon: attempting camera reconnect...")
+			cInfo("[reconnect] attempting camera reconnect...")
 			svc, err := NewService(rs.outputDir)
 			if err != nil {
-				log.Printf("canon: reconnect failed: %v; retrying in %s", err, delay)
+				cWarn("[reconnect] reconnect failed: %v; retrying in %s", err, delay)
 				if delay < max {
 					delay = delay * 2
 					if delay > max {
@@ -151,7 +151,7 @@ func (rs *ReconnectingService) reconnectLoop() {
 			rs.inner = svc
 			rs.mu.Unlock()
 
-			log.Printf("canon: camera reconnected successfully")
+			cInfo("[reconnect] camera reconnected successfully")
 			break
 		}
 	}
