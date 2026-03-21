@@ -2,9 +2,23 @@
 
 package canon
 
+import "C"
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"photoboot-picstop/internal/domain"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unsafe"
+)
+
 /*
 #cgo windows CFLAGS: -I${SRCDIR}/../../../edsdk
-#cgo windows LDFLAGS: -L${SRCDIR}/../../../edsdk -l:EDSDK.lib -lole32
+#cgo windows LDFLAGS: -L${SRCDIR}/../../../edsdk -l:EDSDK.lib -lole32 -luser32
 #cgo darwin CFLAGS: -I${SRCDIR}/../../../edsdk
 #include <stdbool.h>
 
@@ -33,22 +47,27 @@ static EdsError createFileStreamW(const char* path, EdsFileCreateDisposition dis
                                    EdsAccess access, EdsStreamRef* outStream) {
     return EdsCreateFileStream((const EdsChar*)path, disp, access, outStream);
 }
+
+// pumpWindowsMessages drains the calling thread's Windows message queue.
+// This is required on COM STA threads: camera USB ACKs are posted as Windows
+// messages to the thread that sent the EDSDK command. Without pumping, those
+// ACKs queue up and EdsSendCommand / EdsSendStatusCommand block indefinitely.
+#ifdef _WIN32
+static void pumpWindowsMessages(void) {
+    MSG msg;
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) { PostQuitMessage(0); break; }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+#else
+static void pumpWindowsMessages(void) {
+	// empty on non windows
+}
+#endif
 */
 import "C"
-
-import (
-	"context"
-	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
-	"sync"
-	"sync/atomic"
-	"time"
-	"unsafe"
-
-	"photoboot-picstop/internal/domain"
-)
 
 // activeService guarda el Service actual para que los callbacks C puedan despachar eventos.
 var activeService atomic.Pointer[Service]
@@ -107,7 +126,6 @@ type Service struct {
 	stopEventPump chan struct{}
 	eventPumpDone chan struct{}
 	jobStateCh    chan struct{}
-	pumpTaskCh    chan pumpTask // commands to run on the event pump OS thread
 
 	// EVF (Electronic Viewfinder / live preview) state — all guarded by mu.
 	evfActive             atomic.Bool        // true while evfLoop goroutine is running
@@ -128,14 +146,6 @@ type captureRequest struct {
 type captureResult struct {
 	path string
 	err  error
-}
-
-// pumpTask is a function dispatched to the event pump goroutine for execution
-// on its OS thread. All EdsSendCommand calls must go through the pump to avoid
-// deadlocking with EdsGetEvent, which holds the same internal EDSDK lock.
-type pumpTask struct {
-	fn     func() C.EdsError
-	result chan C.EdsError
 }
 
 // NewService inicializa el SDK, descubre la primera cámara, abre sesión, registra handlers y configura SaveTo=Host.
@@ -208,7 +218,6 @@ func NewService(outputDir string) (_ *Service, retErr error) {
 		eventPumpDone:  make(chan struct{}),
 		jobStateCh:     make(chan struct{}, 1),
 		disconnectedCh: make(chan struct{}),
-		pumpTaskCh:     make(chan pumpTask, 1),
 	}
 	activeService.Store(svc)
 	defer func() {
@@ -298,7 +307,10 @@ func (s *Service) capture(ctx context.Context) (captureResult, error) {
 		go func() {
 			SetGoroutineRole("preempt")
 			defer s.bgWg.Done()
-			s.resetShutterStateOnPump()
+			_ = withPlatformThreading(func() error {
+				s.resetShutterState()
+				return nil
+			})
 		}()
 		if preemptWindow > 0 {
 			cInfo("[capture] sleeping for preempt window %s", preemptWindow)
@@ -367,22 +379,18 @@ func (s *Service) capture(ctx context.Context) (captureResult, error) {
 // sendTakePicture acquires the camera UI lock (EDSDK §2.7), fires the shutter
 // via PressShutterButton, then releases the lock unconditionally.
 //
-// UI lock prevents the camera body's own UI from interfering with remote
-// commands. A missing lock can cause kEdsCameraCommand_PressShutterButton to
-// return EDS_ERR_DEVICE_BUSY even when the camera appears idle.
+// THREADING: Must be called from within a withPlatformThreading context (a
+// dedicated COM STA OS thread, separate from the event pump). The pump goroutine
+// runs EdsGetEvent concurrently, which delivers the camera's USB ACKs so that
+// PressShutterButton can return. pumpWindowsMessages() is called between each
+// command to drain this thread's Windows message queue for the same reason.
 //
-// Shutter strategy: try ShutterButton_Completely (with AF) first; fall back to
-// ShutterButton_Completely_NonAF if the camera reports an AF/busy error.
+// Shutter strategy: ShutterButton_Completely (AF) first; NonAF fallback on failure.
 func (s *Service) sendTakePicture() error {
-	// ── UI Lock (EDSDK §2.7) ────────────────────────────────────────────────
-	// Lock the camera UI before any remote shutter command. Failures here are
-	// logged but do not abort the capture — the shutter attempt proceeds and
-	// the unlock is always sent to leave the camera in a clean state.
 	uiLocked := s.uiLock()
 	defer s.uiUnlock(uiLocked)
 
-	// ── Primary path: ShutterButton_Completely (AF enabled) ─────────────────
-	cInfo("[shutter] pressing ShutterButton_Completely via pump (uiLocked=%v)", uiLocked)
+	cInfo("[shutter] pressing ShutterButton_Completely (uiLocked=%v)", uiLocked)
 	pressCode, releaseCode := s.pressAndReleaseShutter(
 		C.EdsInt32(C.kEdsCameraCommand_ShutterButton_Completely),
 	)
@@ -394,11 +402,10 @@ func (s *Service) sendTakePicture() error {
 		if releaseCode != C.EDS_ERR_OK {
 			return edsCheck("EdsSendCommand(ShutterButton_OFF after Completely)", releaseCode)
 		}
-		cInfo("[shutter] ShutterButton_Completely succeeded — waiting for transfer event")
+		cInfo("[shutter] ShutterButton_Completely succeeded — camera firing, waiting for transfer event")
 		return nil
 	}
 
-	// ── Fallback: ShutterButton_Completely_NonAF ────────────────────────────
 	cWarn("[shutter] ShutterButton_Completely failed (%s); retrying with NonAF", edsErrName(pressCode))
 	nonAFPressCode, nonAFReleaseCode := s.pressAndReleaseShutter(
 		C.EdsInt32(C.kEdsCameraCommand_ShutterButton_Completely_NonAF),
@@ -411,7 +418,7 @@ func (s *Service) sendTakePicture() error {
 		if nonAFReleaseCode != C.EDS_ERR_OK {
 			return edsCheck("EdsSendCommand(ShutterButton_OFF after NonAF)", nonAFReleaseCode)
 		}
-		cInfo("[shutter] ShutterButton_NonAF succeeded — waiting for transfer event")
+		cInfo("[shutter] ShutterButton_NonAF succeeded — camera firing, waiting for transfer event")
 		return nil
 	}
 
@@ -420,13 +427,12 @@ func (s *Service) sendTakePicture() error {
 	return fmt.Errorf("%w; NonAF also failed: %v", pressErr, nonAFErr)
 }
 
-// uiLock sends kEdsCameraStatusCommand_UILock via the pump (EDSDK §2.7).
-// Returns true if the lock was acquired; callers must always call uiUnlock(locked).
+// uiLock sends UILock directly on the current STA thread (EDSDK §2.7).
+// Must be called from within a withPlatformThreading context.
 func (s *Service) uiLock() bool {
-	camera := s.camera
-	code := s.execOnPump(func() C.EdsError {
-		return C.EdsSendStatusCommand(camera, C.kEdsCameraStatusCommand_UILock, 0)
-	})
+	cDebug("[shutter] sending UILock")
+	code := C.EdsSendStatusCommand(s.camera, C.kEdsCameraStatusCommand_UILock, 0)
+	cDebug("[shutter] UILock → %s (0x%08X)", edsErrName(code), uint32(code))
 	if code == C.EDS_ERR_OK {
 		cInfo("[shutter] UI lock acquired")
 		return true
@@ -435,26 +441,29 @@ func (s *Service) uiLock() bool {
 	return false
 }
 
-// uiUnlock sends kEdsCameraStatusCommand_UIUnlock via the pump.
-// Only sent if uiLock succeeded (locked==true). Always called via defer.
+// uiUnlock sends UIUnLock directly on the current STA thread.
+// Must be called from within a withPlatformThreading context. Always called via defer.
 func (s *Service) uiUnlock(locked bool) {
 	if !locked {
 		cDebug("[shutter] UIUnlock skipped (lock was not held)")
 		return
 	}
-	camera := s.camera
-	code := s.execOnPump(func() C.EdsError {
-		return C.EdsSendStatusCommand(camera, C.kEdsCameraStatusCommand_UIUnLock, 0)
-	})
+	code := C.EdsSendStatusCommand(s.camera, C.kEdsCameraStatusCommand_UIUnLock, 0)
+	cDebug("[shutter] UIUnLock → %s (0x%08X)", edsErrName(code), uint32(code))
 	if code == C.EDS_ERR_OK {
 		cInfo("[shutter] UI lock released")
 	} else {
-		cWarn("[shutter] UIUnlock failed (%s 0x%08X)", edsErrName(code), uint32(code))
+		cWarn("[shutter] UIUnLock failed (%s 0x%08X)", edsErrName(code), uint32(code))
 	}
 }
 
-// sendTakePictureWithTimeout fires the shutter with a timeout guard.
-// The actual EdsSendCommand calls run on the event pump goroutine via execOnPump.
+// sendTakePictureWithTimeout fires the shutter on a dedicated STA OS thread
+// (separate from the event pump) with a timeout guard.
+//
+// Why a separate thread: PressShutterButton sends a USB command and waits for
+// the camera's ACK. That ACK arrives via EdsGetEvent on the pump thread. Both
+// threads must run concurrently — routing commands through the pump blocks
+// EdsGetEvent and deadlocks the whole flow.
 func (s *Service) sendTakePictureWithTimeout(timeout time.Duration) error {
 	if timeout <= 0 {
 		return fmt.Errorf("%w after %s", domain.ErrShutterCommandTimeout, timeout)
@@ -466,62 +475,62 @@ func (s *Service) sendTakePictureWithTimeout(timeout time.Duration) error {
 	go func() {
 		SetGoroutineRole("shutter")
 		defer s.bgWg.Done()
-		cDebug("[shutter] goroutine started: dispatching TakePicture to pump thread")
-		resultCh <- s.sendTakePicture()
+		cDebug("[shutter] goroutine started: initializing dedicated STA thread")
+		resultCh <- withPlatformThreading(func() error {
+			return s.sendTakePicture()
+		})
 	}()
 
 	select {
 	case err := <-resultCh:
 		if err == nil {
-			cInfo("[shutter] shutter command returned OK")
+			cInfo("[shutter] shutter commands returned OK")
 		} else {
-			cError("[shutter] shutter command returned error: %v", err)
+			cError("[shutter] shutter commands returned error: %v", err)
 		}
 		return err
 	case <-time.After(timeout):
-		cError("[shutter] TIMEOUT after %s — shutter goroutine still running; sending ShutterButton_OFF to reset", timeout)
-		// Best-effort reset on pump thread.
+		cError("[shutter] TIMEOUT after %s — shutter goroutine still blocked; spawning reset goroutine", timeout)
 		s.bgWg.Add(1)
 		go func() {
 			SetGoroutineRole("reset")
 			defer s.bgWg.Done()
-			s.resetShutterStateOnPump()
+			_ = withPlatformThreading(func() error {
+				s.resetShutterState()
+				return nil
+			})
 		}()
 		return fmt.Errorf("%w after %s", domain.ErrShutterCommandTimeout, timeout)
 	}
 }
 
+// pressAndReleaseShutter sends press+release on the current STA OS thread.
+// pumpWindowsMessages is called between press and release to drain this thread's
+// Windows message queue so COM STA can deliver the camera's ACK for the press.
 func (s *Service) pressAndReleaseShutter(pressParam C.EdsInt32) (C.EdsError, C.EdsError) {
-	pressCode := s.sendCameraCommandOnPump(
+	pressCode := sendCameraCommandDirect(s.camera,
+		C.kEdsCameraCommand_PressShutterButton, pressParam, 10, 220*time.Millisecond)
+	C.pumpWindowsMessages()
+	releaseCode := sendCameraCommandDirect(s.camera,
 		C.kEdsCameraCommand_PressShutterButton,
-		pressParam,
-		10,
-		220*time.Millisecond,
-	)
-	releaseCode := s.sendCameraCommandOnPump(
-		C.kEdsCameraCommand_PressShutterButton,
-		C.EdsInt32(C.kEdsCameraCommand_ShutterButton_OFF),
-		8,
-		120*time.Millisecond,
-	)
+		C.EdsInt32(C.kEdsCameraCommand_ShutterButton_OFF), 8, 120*time.Millisecond)
 	return pressCode, releaseCode
 }
 
-// resetShutterStateOnPump sends ShutterButton_OFF via the pump thread to leave
-// the shutter in a known state.
-func (s *Service) resetShutterStateOnPump() {
-	_ = s.sendCameraCommandOnPump(
+// resetShutterState sends ShutterButton_OFF to leave the shutter in a known state.
+// Must be called from within a withPlatformThreading context.
+func (s *Service) resetShutterState() {
+	_ = sendCameraCommandDirect(s.camera,
 		C.kEdsCameraCommand_PressShutterButton,
-		C.EdsInt32(C.kEdsCameraCommand_ShutterButton_OFF),
-		3,
-		120*time.Millisecond,
-	)
+		C.EdsInt32(C.kEdsCameraCommand_ShutterButton_OFF), 3, 120*time.Millisecond)
 }
 
-// sendCameraCommandOnPump dispatches each EdsSendCommand attempt to the event pump
-// goroutine. Between retries the caller goroutine sleeps, allowing the pump to
-// continue calling EdsGetEvent normally.
-func (s *Service) sendCameraCommandOnPump(
+// sendCameraCommandDirect calls EdsSendCommand on the current OS thread with retries.
+// Must be called from within a withPlatformThreading context (dedicated COM STA thread).
+// Pumps Windows messages and calls EdsGetEvent between retries so camera ACKs
+// that arrive as Windows messages can be processed before the next attempt.
+func sendCameraCommandDirect(
+	camera C.EdsCameraRef,
 	command C.EdsCameraCommand,
 	param C.EdsInt32,
 	attempts int,
@@ -531,13 +540,10 @@ func (s *Service) sendCameraCommandOnPump(
 		attempts = 1
 	}
 	cmdName := edsCameraCommandName(command, param)
-	camera := s.camera
-	cDebug("[cmd] dispatching EdsSendCommand(%s) to pump — up to %d attempt(s)", cmdName, attempts)
+	cDebug("[cmd] EdsSendCommand(%s) — up to %d attempt(s)", cmdName, attempts)
 	var code C.EdsError
 	for i := 0; i < attempts; i++ {
-		code = s.execOnPump(func() C.EdsError {
-			return C.EdsSendCommand(camera, command, param)
-		})
+		code = C.EdsSendCommand(camera, command, param)
 		cDebug("[cmd] EdsSendCommand(%s) attempt %d/%d → %s (0x%08X)",
 			cmdName, i+1, attempts, edsErrName(code), uint32(code))
 		if code == C.EDS_ERR_OK {
@@ -547,7 +553,8 @@ func (s *Service) sendCameraCommandOnPump(
 			cWarn("[cmd] non-retryable error on %s, stopping retries", cmdName)
 			return code
 		}
-		// Sleep in caller goroutine — pump keeps calling EdsGetEvent between retries.
+		C.pumpWindowsMessages()
+		_ = C.EdsGetEvent()
 		time.Sleep(delay)
 	}
 	cWarn("[cmd] all %d attempt(s) exhausted for %s", attempts, cmdName)
@@ -1308,9 +1315,8 @@ func (s *Service) Disconnected() <-chan struct{} {
 }
 
 // startEventPump runs EdsGetEvent on a dedicated OS thread (COM STA) so that
-// EDSDK callbacks fire correctly. It also executes pumpTask commands on the
-// same thread — this is critical: EdsSendCommand and EdsGetEvent must share a
-// single OS thread to avoid internal EDSDK lock deadlocks.
+// EDSDK callbacks fire correctly. The shutter goroutine runs on its own STA
+// thread via withPlatformThreading, so this goroutine only pumps events.
 func (s *Service) startEventPump() {
 	go func() {
 		SetGoroutineRole("pump")
@@ -1333,16 +1339,6 @@ func (s *Service) startEventPump() {
 			case <-s.stopEventPump:
 				return
 
-			case task := <-s.pumpTaskCh:
-				// Run the EDSDK command on this OS thread, then send the result.
-				// While this runs, EdsGetEvent is NOT called — that's intentional:
-				// EdsSendCommand holds the EDSDK internal lock so EdsGetEvent would
-				// block anyway. After the command returns, the ticker resumes pumping.
-				cDebug("[pump] executing task on pump thread")
-				code := task.fn()
-				cDebug("[pump] task complete: %s (0x%08X)", edsErrName(code), uint32(code))
-				task.result <- code
-
 			case <-ticker.C:
 				pumpCalls++
 				result := C.EdsGetEvent()
@@ -1355,19 +1351,6 @@ func (s *Service) startEventPump() {
 			}
 		}
 	}()
-}
-
-// execOnPump dispatches fn to the event pump goroutine and waits for the result.
-// Use this for all EdsSendCommand calls to guarantee single-threaded EDSDK access.
-func (s *Service) execOnPump(fn func() C.EdsError) C.EdsError {
-	task := pumpTask{fn: fn, result: make(chan C.EdsError, 1)}
-	select {
-	case s.pumpTaskCh <- task:
-		return <-task.result
-	case <-s.stopEventPump:
-		cWarn("[pump] execOnPump: pump stopped, returning internal error")
-		return C.EDS_ERR_INTERNAL_ERROR
-	}
 }
 
 // ─────────────────────────────────────────────
