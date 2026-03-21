@@ -2,20 +2,6 @@
 
 package canon
 
-import "C"
-import (
-	"context"
-	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
-	"photoboot-picstop/internal/domain"
-	"sync"
-	"sync/atomic"
-	"time"
-	"unsafe"
-)
-
 /*
 #cgo windows CFLAGS: -I${SRCDIR}/../../../edsdk
 #cgo windows LDFLAGS: -L${SRCDIR}/../../../edsdk -l:EDSDK.lib -lole32 -luser32
@@ -49,9 +35,8 @@ static EdsError createFileStreamW(const char* path, EdsFileCreateDisposition dis
 }
 
 // pumpWindowsMessages drains the calling thread's Windows message queue.
-// This is required on COM STA threads: camera USB ACKs are posted as Windows
-// messages to the thread that sent the EDSDK command. Without pumping, those
-// ACKs queue up and EdsSendCommand / EdsSendStatusCommand block indefinitely.
+// On the SDK thread (COM STA), calling this between EDSDK command retries helps
+// drain any queued Windows messages so the next attempt starts clean.
 #ifdef _WIN32
 static void pumpWindowsMessages(void) {
     MSG msg;
@@ -62,14 +47,25 @@ static void pumpWindowsMessages(void) {
     }
 }
 #else
-static void pumpWindowsMessages(void) {
-	// empty on non windows
-}
+static void pumpWindowsMessages(void) {}
 #endif
 */
 import "C"
 
-// activeService guarda el Service actual para que los callbacks C puedan despachar eventos.
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"photoboot-picstop/internal/domain"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unsafe"
+)
+
+// activeService holds the current Service so CGo callbacks can dispatch events.
 var activeService atomic.Pointer[Service]
 
 // sdkMu / sdkRefs guard EdsInitializeSDK / EdsTerminateSDK so the SDK is initialised
@@ -99,11 +95,20 @@ func releaseSDK() {
 	defer sdkMu.Unlock()
 	sdkRefs--
 	if sdkRefs == 0 {
-		_ = C.EdsTerminateSDK()
+		if err := edsCheck("EdsTerminateSDK", C.EdsTerminateSDK()); err != nil {
+			cWarn("[sdk] EdsTerminateSDK failed: %v", err)
+		}
 	}
 }
 
-// Service implementa el puerto de cámara (CameraPort) usando Canon EDSDK en Windows.
+// Service implements the camera port using Canon EDSDK on Windows.
+//
+// Threading model: a single dedicated OS thread (the "SDK thread") owns all EDSDK
+// state for this Service's lifetime. Per EDSDK §2.8, callbacks fire on the thread
+// that established the session. All EdsSendCommand calls must also come from this
+// thread so their USB ACKs arrive in its Windows message queue (COM STA) and are
+// processed by EdsSendCommand or EdsGetEvent on the same thread.
+// Other goroutines communicate with the SDK thread via sdkCh.
 type Service struct {
 	mu        sync.Mutex
 	closeOnce sync.Once
@@ -114,27 +119,29 @@ type Service struct {
 	outputDir              string
 	pending                *captureRequest
 	closed                 bool
-	cameraDisconnected     bool // set by onStateEvent(kEdsStateEvent_Shutdown); skips EdsCloseSession in Close()
+	cameraDisconnected     bool // set by onStateEvent(kEdsStateEvent_Shutdown)
 	jobBusy                atomic.Uint32
 	suppressTransfersUntil time.Time
 
 	// disconnectedCh is closed (exactly once) when kEdsStateEvent_Shutdown fires.
-	// ReconnectingService waits on this to know when to start a reconnect attempt.
 	disconnectedCh   chan struct{}
 	disconnectedOnce sync.Once
 
+	// sdkCh delivers tasks to the SDK thread. Buffer of 4 prevents deadlock when
+	// the preempt goroutine and the capture goroutine both post near-simultaneously.
+	sdkCh         chan func()
 	stopEventPump chan struct{}
 	eventPumpDone chan struct{}
 	jobStateCh    chan struct{}
 
 	// EVF (Electronic Viewfinder / live preview) state — all guarded by mu.
-	evfActive             atomic.Bool        // true while evfLoop goroutine is running
-	evfSuspendedByCapture atomic.Bool        // true while EVF is suspended for a capture cycle
-	evfStop               chan struct{}      // closed to signal evfLoop to stop; nil when EVF off
-	evfDone               chan struct{}      // closed when evfLoop exits; nil when EVF off
-	evfFrameCh            chan []byte        // current frame sink; nil when no preview client
-	evfCtx                context.Context    // lifetime of the current preview client
-	evfCancel             context.CancelFunc // cancels evfCtx
+	evfActive             atomic.Bool
+	evfSuspendedByCapture atomic.Bool
+	evfStop               chan struct{}
+	evfDone               chan struct{}
+	evfFrameCh            chan []byte
+	evfCtx                context.Context
+	evfCancel             context.CancelFunc
 
 	bgWg sync.WaitGroup
 }
@@ -148,7 +155,7 @@ type captureResult struct {
 	err  error
 }
 
-// NewService inicializa el SDK, descubre la primera cámara, abre sesión, registra handlers y configura SaveTo=Host.
+// NewService creates a Service, spawns the SDK thread, waits for camera init, and returns.
 func NewService(outputDir string) (_ *Service, retErr error) {
 	absDir, err := filepath.Abs(outputDir)
 	if err != nil {
@@ -158,93 +165,161 @@ func NewService(outputDir string) (_ *Service, retErr error) {
 		return nil, fmt.Errorf("create capture dir: %w", err)
 	}
 
-	uninitThreading, err := initPlatformThreading()
-	if err != nil {
-		return nil, err
-	}
-	defer uninitThreading()
-
-	if err := acquireSDK(); err != nil {
-		return nil, err
-	}
-	cInfo("[init] SDK initialized")
-	sdkInitialized := true
-	defer func() {
-		if retErr != nil && sdkInitialized {
-			releaseSDK()
-		}
-	}()
-
-	discoveryTimeout := cameraDiscoveryTimeout()
-	cInfo("[init] discovering camera (timeout=%s)", discoveryTimeout)
-	cameraBase, err := waitForFirstCamera(discoveryTimeout)
-	if err != nil {
-		return nil, err
-	}
-	camera := C.EdsCameraRef(cameraBase)
-	cameraOwned := true
-	defer func() {
-		if retErr != nil && cameraOwned {
-			releaseRef(cameraBase)
-		}
-	}()
-
-	handler := (C.EdsObjectEventHandler)(C.goObjectEventHandler)
-	if err := edsCheck("EdsSetObjectEventHandler", C.EdsSetObjectEventHandler(camera, C.kEdsObjectEvent_All, handler, nil)); err != nil {
-		return nil, err
-	}
-	cInfo("[init] object event handler registered")
-	stateHandler := (C.EdsStateEventHandler)(C.goCameraStateEventHandler)
-	if err := edsCheck("EdsSetCameraStateEventHandler", C.EdsSetCameraStateEventHandler(camera, C.kEdsStateEvent_All, stateHandler, nil)); err != nil {
-		return nil, err
-	}
-	cInfo("[init] state event handler registered")
-
-	if err := openSessionWithRetry(camera); err != nil {
-		return nil, err
-	}
-	cInfo("[init] camera session opened")
-	sessionOpen := true
-	defer func() {
-		if retErr != nil && sessionOpen {
-			_ = C.EdsCloseSession(camera)
-		}
-	}()
-
 	svc := &Service{
-		camera:         camera,
 		outputDir:      absDir,
+		sdkCh:          make(chan func(), 4),
 		stopEventPump:  make(chan struct{}),
 		eventPumpDone:  make(chan struct{}),
 		jobStateCh:     make(chan struct{}, 1),
 		disconnectedCh: make(chan struct{}),
 	}
-	activeService.Store(svc)
-	defer func() {
-		if retErr != nil {
-			activeService.CompareAndSwap(svc, nil)
-		}
-	}()
 
-	if err := configureCamera(camera); err != nil {
+	initDone := make(chan error, 1)
+	go svc.runSDKThread(initDone)
+
+	if err := <-initDone; err != nil {
 		return nil, err
 	}
-	cInfo("[init] camera configured")
-
-	cInfo("[init] starting event pump")
-	svc.startEventPump()
-
-	sessionOpen = false
-	cameraOwned = false
-	sdkInitialized = false
 	return svc, nil
+}
+
+// ─────────────────────────────────────────────
+// SDK thread
+// ─────────────────────────────────────────────
+
+// runSDKThread is the single goroutine that owns all EDSDK state. It:
+//  1. Locks itself to one OS thread and initialises COM STA (via initPlatformThreading).
+//  2. Initialises the SDK, discovers the camera, opens the session, configures it.
+//  3. Signals initDone so NewService can return.
+//  4. Enters the event loop: EdsGetEvent every 20 ms, plus tasks from sdkCh.
+//  5. On stopEventPump, closes the session, releases the SDK ref, and returns.
+func (s *Service) runSDKThread(initDone chan<- error) {
+	SetGoroutineRole("sdk")
+	defer close(s.eventPumpDone)
+
+	// Lock this goroutine to its OS thread and init COM STA for the whole lifetime.
+	uninitThreading, err := initPlatformThreading()
+	if err != nil {
+		initDone <- fmt.Errorf("platform threading init: %w", err)
+		return
+	}
+	defer uninitThreading()
+
+	// ── SDK + camera init ──────────────────────────────────────────────────
+	if err := acquireSDK(); err != nil {
+		initDone <- err
+		return
+	}
+	cInfo("[init] SDK initialized")
+
+	discoveryTimeout := cameraDiscoveryTimeout()
+	cInfo("[init] discovering camera (timeout=%s)", discoveryTimeout)
+	cameraBase, err := waitForFirstCamera(discoveryTimeout)
+	if err != nil {
+		releaseSDK()
+		initDone <- err
+		return
+	}
+	camera := C.EdsCameraRef(cameraBase)
+
+	handler := (C.EdsObjectEventHandler)(C.goObjectEventHandler)
+	if err := edsCheck("EdsSetObjectEventHandler",
+		C.EdsSetObjectEventHandler(camera, C.kEdsObjectEvent_All, handler, nil)); err != nil {
+		releaseRef(cameraBase)
+		releaseSDK()
+		initDone <- err
+		return
+	}
+	cInfo("[init] object event handler registered")
+
+	stateHandler := (C.EdsStateEventHandler)(C.goCameraStateEventHandler)
+	if err := edsCheck("EdsSetCameraStateEventHandler",
+		C.EdsSetCameraStateEventHandler(camera, C.kEdsStateEvent_All, stateHandler, nil)); err != nil {
+		releaseRef(cameraBase)
+		releaseSDK()
+		initDone <- err
+		return
+	}
+	cInfo("[init] state event handler registered")
+
+	if err := openSessionWithRetry(camera); err != nil {
+		releaseRef(cameraBase)
+		releaseSDK()
+		initDone <- err
+		return
+	}
+	cInfo("[init] camera session opened")
+
+	s.camera = camera
+	activeService.Store(s)
+
+	if err := configureCamera(camera); err != nil {
+		cWarn("[init] camera configuration warning (non-fatal): %v", err)
+	}
+	cInfo("[init] camera configured; entering SDK event loop")
+
+	// Signal NewService that init succeeded.
+	initDone <- nil
+
+	// ── Event loop ─────────────────────────────────────────────────────────
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	var loopCalls uint64
+
+	for {
+		select {
+		case <-s.stopEventPump:
+			cInfo("[sdk] stop signal — closing session and releasing SDK")
+			s.mu.Lock()
+			disconnected := s.cameraDisconnected
+			s.mu.Unlock()
+			if !disconnected {
+				if err := edsCheck("EdsCloseSession", C.EdsCloseSession(camera)); err != nil {
+					cWarn("[sdk] EdsCloseSession error: %v", err)
+				}
+			}
+			releaseRef(C.EdsBaseRef(camera))
+			releaseSDK()
+			return
+
+		case task := <-s.sdkCh:
+			task()
+
+		case <-ticker.C:
+			loopCalls++
+			result := C.EdsGetEvent()
+			if loopCalls%500 == 0 {
+				cDebug("[sdk] heartbeat: %d EdsGetEvent calls", loopCalls)
+			}
+			if result != C.EDS_ERR_OK {
+				cWarn("[sdk] EdsGetEvent returned %s (0x%08X)", edsErrName(result), uint32(result))
+			}
+		}
+	}
+}
+
+// postSDKTask posts fn to the SDK thread, waits for it to run, and returns its error.
+// Returns an error immediately if the service is being stopped.
+func (s *Service) postSDKTask(fn func() error) error {
+	resultCh := make(chan error, 1)
+	select {
+	case s.sdkCh <- func() { resultCh <- fn() }:
+	case <-s.stopEventPump:
+		return errors.New("service closed")
+	}
+	select {
+	case err := <-resultCh:
+		return err
+	case <-s.stopEventPump:
+		return errors.New("service closed")
+	}
 }
 
 // ─────────────────────────────────────────────
 // Capture
 // ─────────────────────────────────────────────
 
-// Capture dispara una foto, espera a que el archivo sea descargado al host y devuelve la ruta local.
+// Capture fires a photo and waits for the camera to finish saving it to the SD card.
 func (s *Service) Capture(ctx context.Context) (string, error) {
 	result, err := s.capture(ctx)
 	if err != nil {
@@ -264,10 +339,7 @@ func (s *Service) capture(ctx context.Context) (captureResult, error) {
 	}
 
 	// ── Suspend EVF before doing anything with the camera ──────────────────
-	// evfSuspendedByCapture tracks whether WE are the goroutine that suspended
-	// EVF, so that maybeResumeEVF knows who should restart it.
 	if s.evfActive.Load() && !s.evfSuspendedByCapture.Swap(true) {
-		// We set evfSuspendedByCapture false→true: we own the suspend.
 		cInfo("[capture] suspending EVF before capture")
 		s.suspendEVF()
 		cInfo("[capture] EVF suspended (+%s)", time.Since(captureStart))
@@ -307,10 +379,12 @@ func (s *Service) capture(ctx context.Context) (captureResult, error) {
 		go func() {
 			SetGoroutineRole("preempt")
 			defer s.bgWg.Done()
-			_ = withPlatformThreading(func() error {
-				s.resetShutterState()
-				return nil
-			})
+			done := make(chan struct{}, 1)
+			select {
+			case s.sdkCh <- func() { s.resetShutterState(); done <- struct{}{} }:
+				<-done
+			case <-s.stopEventPump:
+			}
 		}()
 		if preemptWindow > 0 {
 			cInfo("[capture] sleeping for preempt window %s", preemptWindow)
@@ -347,25 +421,25 @@ func (s *Service) capture(ctx context.Context) (captureResult, error) {
 		s.maybeResumeEVF()
 		return captureResult{}, err
 	}
-	cInfo("[capture] shutter command SUCCESS — now waiting for DirItemRequestTransfer event (+%s)", time.Since(captureStart))
+	cInfo("[capture] shutter command SUCCESS — waiting for DirItemCreated+download (+%s)", time.Since(captureStart))
 
-	// ── Wait for onObjectEvent to deliver the downloaded file ──────────────
-	// DirItemRequestTransfer → onObjectEvent → EdsDownload → notifyCaptureResult.
-	transferDeadline := hostTransferTimeout()
-	cDebug("[capture] host transfer timeout=%s", transferDeadline)
+	// ── Wait for download to complete ──────────────────────────────────────
+	// onObjectEvent(DirItemCreated) downloads the file, deletes it from SD,
+	// then calls notifyCaptureResult on req.
+	saveTimeout := hostTransferTimeout()
+	cDebug("[capture] download timeout=%s", saveTimeout)
 	select {
 	case result := <-req.done:
-		cInfo("[capture] COMPLETE — path=%q err=%v elapsed=%s",
-			result.path, result.err, time.Since(captureStart))
+		cInfo("[capture] COMPLETE — err=%v elapsed=%s", result.err, time.Since(captureStart))
 		s.maybeResumeEVF()
 		return result, nil
-	case <-time.After(transferDeadline):
-		cError("[capture] TIMEOUT waiting for DirItemRequestTransfer after %s — shutter fired but no transfer event received; check SaveTo mode and SD card", transferDeadline)
+	case <-time.After(saveTimeout):
+		cError("[capture] TIMEOUT waiting for DirItemCreated after %s — camera may not have fired or SD card missing", saveTimeout)
 		s.clearPending(req)
 		s.maybeResumeEVF()
-		return captureResult{}, fmt.Errorf("host transfer timed out after %s", transferDeadline)
+		return captureResult{}, fmt.Errorf("capture timed out after %s (no file received from camera)", saveTimeout)
 	case <-ctx.Done():
-		cWarn("[capture] context cancelled while waiting for transfer: %v (+%s)", ctx.Err(), time.Since(captureStart))
+		cWarn("[capture] context cancelled while waiting for job: %v (+%s)", ctx.Err(), time.Since(captureStart))
 		s.clearPending(req)
 		s.maybeResumeEVF()
 		return captureResult{}, ctx.Err()
@@ -376,21 +450,65 @@ func (s *Service) capture(ctx context.Context) (captureResult, error) {
 // Shutter commands
 // ─────────────────────────────────────────────
 
-// sendTakePicture acquires the camera UI lock (EDSDK §2.7), fires the shutter
-// via PressShutterButton, then releases the lock unconditionally.
+// sendTakePictureWithTimeout posts the shutter command to the SDK thread and
+// waits for the result with a timeout guard.
 //
-// THREADING: Must be called from within a withPlatformThreading context (a
-// dedicated COM STA OS thread, separate from the event pump). The pump goroutine
-// runs EdsGetEvent concurrently, which delivers the camera's USB ACKs so that
-// PressShutterButton can return. pumpWindowsMessages() is called between each
-// command to drain this thread's Windows message queue for the same reason.
-//
-// Shutter strategy: ShutterButton_Completely (AF) first; NonAF fallback on failure.
-func (s *Service) sendTakePicture() error {
-	uiLocked := s.uiLock()
-	defer s.uiUnlock(uiLocked)
+// THREADING: EdsSendCommand must run on the SDK thread (same thread as EdsGetEvent
+// and EdsOpenSession). Posting via sdkCh guarantees this.
+func (s *Service) sendTakePictureWithTimeout(timeout time.Duration) error {
+	if timeout <= 0 {
+		return fmt.Errorf("%w after %s", domain.ErrShutterCommandTimeout, timeout)
+	}
 
-	cInfo("[shutter] pressing ShutterButton_Completely (uiLocked=%v)", uiLocked)
+	cInfo("[shutter] sendTakePictureWithTimeout timeout=%s", timeout)
+	resultCh := make(chan error, 1)
+
+	task := func() {
+		resultCh <- s.sendTakePicture()
+	}
+
+	// Post task to SDK thread.
+	select {
+	case s.sdkCh <- task:
+	case <-time.After(timeout):
+		cError("[shutter] TIMEOUT posting task to SDK thread after %s", timeout)
+		return fmt.Errorf("%w after %s", domain.ErrShutterCommandTimeout, timeout)
+	case <-s.stopEventPump:
+		return errors.New("service closed")
+	}
+
+	// Wait for SDK thread to complete the shutter sequence.
+	select {
+	case err := <-resultCh:
+		if err == nil {
+			cInfo("[shutter] shutter commands returned OK")
+		} else {
+			cError("[shutter] shutter commands returned error: %v", err)
+		}
+		return err
+	case <-time.After(timeout):
+		cError("[shutter] TIMEOUT after %s — camera not responding; spawning reset", timeout)
+		s.bgWg.Add(1)
+		go func() {
+			SetGoroutineRole("reset")
+			defer s.bgWg.Done()
+			done := make(chan struct{}, 1)
+			select {
+			case s.sdkCh <- func() { s.resetShutterState(); done <- struct{}{} }:
+				<-done
+			case <-s.stopEventPump:
+			}
+		}()
+		return fmt.Errorf("%w after %s", domain.ErrShutterCommandTimeout, timeout)
+	}
+}
+
+// sendTakePicture fires the shutter via PressShutterButton.
+// Must be called from the SDK thread (via sdkCh).
+//
+// Strategy: ShutterButton_Completely (AF) first; NonAF fallback on failure.
+func (s *Service) sendTakePicture() error {
+	cInfo("[shutter] pressing ShutterButton_Completely")
 	pressCode, releaseCode := s.pressAndReleaseShutter(
 		C.EdsInt32(C.kEdsCameraCommand_ShutterButton_Completely),
 	)
@@ -402,7 +520,7 @@ func (s *Service) sendTakePicture() error {
 		if releaseCode != C.EDS_ERR_OK {
 			return edsCheck("EdsSendCommand(ShutterButton_OFF after Completely)", releaseCode)
 		}
-		cInfo("[shutter] ShutterButton_Completely succeeded — camera firing, waiting for transfer event")
+		cInfo("[shutter] ShutterButton_Completely succeeded — camera firing")
 		return nil
 	}
 
@@ -418,7 +536,7 @@ func (s *Service) sendTakePicture() error {
 		if nonAFReleaseCode != C.EDS_ERR_OK {
 			return edsCheck("EdsSendCommand(ShutterButton_OFF after NonAF)", nonAFReleaseCode)
 		}
-		cInfo("[shutter] ShutterButton_NonAF succeeded — camera firing, waiting for transfer event")
+		cInfo("[shutter] ShutterButton_NonAF succeeded — camera firing")
 		return nil
 	}
 
@@ -427,86 +545,9 @@ func (s *Service) sendTakePicture() error {
 	return fmt.Errorf("%w; NonAF also failed: %v", pressErr, nonAFErr)
 }
 
-// uiLock sends UILock directly on the current STA thread (EDSDK §2.7).
-// Must be called from within a withPlatformThreading context.
-func (s *Service) uiLock() bool {
-	cDebug("[shutter] sending UILock")
-	code := C.EdsSendStatusCommand(s.camera, C.kEdsCameraStatusCommand_UILock, 0)
-	cDebug("[shutter] UILock → %s (0x%08X)", edsErrName(code), uint32(code))
-	if code == C.EDS_ERR_OK {
-		cInfo("[shutter] UI lock acquired")
-		return true
-	}
-	cWarn("[shutter] UILock failed (%s 0x%08X) — proceeding without lock", edsErrName(code), uint32(code))
-	return false
-}
-
-// uiUnlock sends UIUnLock directly on the current STA thread.
-// Must be called from within a withPlatformThreading context. Always called via defer.
-func (s *Service) uiUnlock(locked bool) {
-	if !locked {
-		cDebug("[shutter] UIUnlock skipped (lock was not held)")
-		return
-	}
-	code := C.EdsSendStatusCommand(s.camera, C.kEdsCameraStatusCommand_UIUnLock, 0)
-	cDebug("[shutter] UIUnLock → %s (0x%08X)", edsErrName(code), uint32(code))
-	if code == C.EDS_ERR_OK {
-		cInfo("[shutter] UI lock released")
-	} else {
-		cWarn("[shutter] UIUnLock failed (%s 0x%08X)", edsErrName(code), uint32(code))
-	}
-}
-
-// sendTakePictureWithTimeout fires the shutter on a dedicated STA OS thread
-// (separate from the event pump) with a timeout guard.
-//
-// Why a separate thread: PressShutterButton sends a USB command and waits for
-// the camera's ACK. That ACK arrives via EdsGetEvent on the pump thread. Both
-// threads must run concurrently — routing commands through the pump blocks
-// EdsGetEvent and deadlocks the whole flow.
-func (s *Service) sendTakePictureWithTimeout(timeout time.Duration) error {
-	if timeout <= 0 {
-		return fmt.Errorf("%w after %s", domain.ErrShutterCommandTimeout, timeout)
-	}
-
-	cInfo("[shutter] sendTakePictureWithTimeout timeout=%s", timeout)
-	resultCh := make(chan error, 1)
-	s.bgWg.Add(1)
-	go func() {
-		SetGoroutineRole("shutter")
-		defer s.bgWg.Done()
-		cDebug("[shutter] goroutine started: initializing dedicated STA thread")
-		resultCh <- withPlatformThreading(func() error {
-			return s.sendTakePicture()
-		})
-	}()
-
-	select {
-	case err := <-resultCh:
-		if err == nil {
-			cInfo("[shutter] shutter commands returned OK")
-		} else {
-			cError("[shutter] shutter commands returned error: %v", err)
-		}
-		return err
-	case <-time.After(timeout):
-		cError("[shutter] TIMEOUT after %s — shutter goroutine still blocked; spawning reset goroutine", timeout)
-		s.bgWg.Add(1)
-		go func() {
-			SetGoroutineRole("reset")
-			defer s.bgWg.Done()
-			_ = withPlatformThreading(func() error {
-				s.resetShutterState()
-				return nil
-			})
-		}()
-		return fmt.Errorf("%w after %s", domain.ErrShutterCommandTimeout, timeout)
-	}
-}
-
-// pressAndReleaseShutter sends press+release on the current STA OS thread.
-// pumpWindowsMessages is called between press and release to drain this thread's
-// Windows message queue so COM STA can deliver the camera's ACK for the press.
+// pressAndReleaseShutter sends press then release on the SDK thread.
+// pumpWindowsMessages is called between press and release to drain any queued
+// Windows messages before the next EDSDK call.
 func (s *Service) pressAndReleaseShutter(pressParam C.EdsInt32) (C.EdsError, C.EdsError) {
 	pressCode := sendCameraCommandDirect(s.camera,
 		C.kEdsCameraCommand_PressShutterButton, pressParam, 10, 220*time.Millisecond)
@@ -518,7 +559,7 @@ func (s *Service) pressAndReleaseShutter(pressParam C.EdsInt32) (C.EdsError, C.E
 }
 
 // resetShutterState sends ShutterButton_OFF to leave the shutter in a known state.
-// Must be called from within a withPlatformThreading context.
+// Must be called from the SDK thread.
 func (s *Service) resetShutterState() {
 	_ = sendCameraCommandDirect(s.camera,
 		C.kEdsCameraCommand_PressShutterButton,
@@ -526,9 +567,7 @@ func (s *Service) resetShutterState() {
 }
 
 // sendCameraCommandDirect calls EdsSendCommand on the current OS thread with retries.
-// Must be called from within a withPlatformThreading context (dedicated COM STA thread).
-// Pumps Windows messages and calls EdsGetEvent between retries so camera ACKs
-// that arrive as Windows messages can be processed before the next attempt.
+// Must be called from the SDK thread.
 func sendCameraCommandDirect(
 	camera C.EdsCameraRef,
 	command C.EdsCameraCommand,
@@ -597,15 +636,10 @@ func (s *Service) StartPreview(ctx context.Context) (<-chan []byte, error) {
 	if s.closed {
 		return nil, domain.ErrPreviewUnavailable
 	}
-	// Block EVF start while a capture+download cycle is in progress (s.pending is set
-	// for the entire window from shutter-fire through EdsDownloadComplete). Starting
-	// the EVF goroutine now would put a second OS thread into EDSDK while the event
-	// pump thread is mid-download — concurrent EDSDK calls from two threads.
 	if s.pending != nil {
 		return nil, domain.ErrPreviewUnavailable
 	}
 	if s.evfActive.Load() {
-		// Already running: return the live channel so the new client gets frames.
 		return s.evfFrameCh, nil
 	}
 
@@ -634,7 +668,51 @@ func (s *Service) StopPreview() {
 	done := s.evfDone
 	if stop != nil {
 		select {
-		case <-stop: // already closed
+		case <-stop:
+		default:
+			close(stop)
+		}
+		s.evfStop = nil
+	}
+	s.mu.Unlock()
+
+	if done != nil {
+		<-done
+	}
+
+	// evfLoop may have exited via the <-stop (suspend) path, which does NOT close
+	// frameCh. Close it here so any caller ranging over the channel unblocks.
+	// If evfLoop exited via ctx.Done() it already closed frameCh and set evfFrameCh
+	// to nil, so the nil-check below prevents a double-close.
+	s.mu.Lock()
+	ch := s.evfFrameCh
+	cancel := s.evfCancel
+	if ch != nil {
+		s.evfFrameCh = nil
+		s.evfCtx = nil
+		s.evfCancel = nil
+		s.evfDone = nil
+		s.evfSuspendedByCapture.Store(false)
+	}
+	s.mu.Unlock()
+
+	if ch != nil {
+		if cancel != nil {
+			cancel() // release context resources
+		}
+		close(ch)
+		cInfo("[evf] frame channel closed by StopPreview")
+	}
+}
+
+// suspendEVF stops the EVF goroutine without closing the frame channel.
+func (s *Service) suspendEVF() {
+	s.mu.Lock()
+	stop := s.evfStop
+	done := s.evfDone
+	if stop != nil {
+		select {
+		case <-stop:
 		default:
 			close(stop)
 		}
@@ -647,30 +725,7 @@ func (s *Service) StopPreview() {
 	}
 }
 
-// suspendEVF stops the EVF goroutine without closing the frame channel,
-// so preview clients remain subscribed and frames resume after resumeEVF.
-// Safe to call concurrently; closing the stop channel is guarded by mu.
-func (s *Service) suspendEVF() {
-	s.mu.Lock()
-	stop := s.evfStop
-	done := s.evfDone
-	if stop != nil {
-		select {
-		case <-stop: // already closed
-		default:
-			close(stop)
-		}
-		s.evfStop = nil
-	}
-	s.mu.Unlock()
-
-	if done != nil {
-		<-done // wait outside lock to avoid deadlock
-	}
-}
-
 // resumeEVF starts a new EVF goroutine reusing the existing frame channel.
-// Must only be called after suspendEVF has returned.
 func (s *Service) resumeEVF() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -679,14 +734,12 @@ func (s *Service) resumeEVF() {
 		return
 	}
 	if s.evfActive.Load() {
-		return // already running (e.g. another goroutine beat us here)
+		return
 	}
 
-	// If the client's context was cancelled while we were capturing, don't restart.
 	if s.evfCtx != nil {
 		select {
 		case <-s.evfCtx.Done():
-			// Client disconnected during capture — clean up preview state.
 			s.evfFrameCh = nil
 			s.evfCtx = nil
 			s.evfCancel = nil
@@ -707,8 +760,7 @@ func (s *Service) resumeEVF() {
 	go s.evfLoop(s.evfCtx, s.evfFrameCh, stopCh, doneCh)
 }
 
-// maybeResumeEVF resumes EVF after a capture cycle, but only if no other
-// capture request is pending. Called at the end of every capture() path.
+// maybeResumeEVF resumes EVF after a capture cycle if no other capture is pending.
 func (s *Service) maybeResumeEVF() {
 	if !s.evfSuspendedByCapture.Load() {
 		return
@@ -718,7 +770,6 @@ func (s *Service) maybeResumeEVF() {
 	s.mu.Unlock()
 
 	if hasPending {
-		// Another capture is queued — it will resume EVF when it finishes.
 		return
 	}
 	if s.evfSuspendedByCapture.CompareAndSwap(true, false) {
@@ -727,31 +778,16 @@ func (s *Service) maybeResumeEVF() {
 }
 
 // evfLoop is the dedicated goroutine for EVF frame grabbing.
-// It locks an OS thread with a COM STA context for the entire loop lifetime.
-// Exits when stop is closed (suspend for capture) or ctx is cancelled (client disconnected).
-// On ctx cancellation it closes frameCh to notify the HTTP handler.
+// All EDSDK calls are routed through postSDKTask so they execute on the SDK thread.
 func (s *Service) evfLoop(ctx context.Context, frameCh chan<- []byte, stop <-chan struct{}, done chan<- struct{}) {
 	SetGoroutineRole("evf")
 	defer s.bgWg.Done()
 	defer close(done)
 	defer s.evfActive.Store(false)
 
-	uninitThreading, err := initPlatformThreading()
-	if err != nil {
-		cError("[evf] threading init failed: %v", err)
-		close(frameCh)
-		s.mu.Lock()
-		s.evfFrameCh = nil
-		s.evfCtx = nil
-		s.evfCancel = nil
-		s.mu.Unlock()
-		return
-	}
-	defer uninitThreading()
-
 	camera := s.camera
 
-	if err := startEVFMode(camera); err != nil {
+	if err := s.postSDKTask(func() error { return startEVFMode(camera) }); err != nil {
 		cError("[evf] failed to start EVF mode: %v", err)
 		close(frameCh)
 		s.mu.Lock()
@@ -769,14 +805,14 @@ func (s *Service) evfLoop(ctx context.Context, frameCh chan<- []byte, stop <-cha
 	for {
 		select {
 		case <-stop:
-			// Suspend for capture: stop EVF mode on camera but keep frameCh open.
-			stopEVFMode(camera)
+			if err := s.postSDKTask(func() error { stopEVFMode(camera); return nil }); err != nil {
+				cWarn("[evf] stopEVFMode failed during suspend: %v", err)
+			}
 			cInfo("[evf] EVF suspended for capture")
 			return
 
 		case <-ctx.Done():
-			// Client disconnected: stop EVF and close the channel.
-			stopEVFMode(camera)
+			_ = s.postSDKTask(func() error { stopEVFMode(camera); return nil })
 			cInfo("[evf] EVF stopped (client disconnected)")
 			close(frameCh)
 			s.mu.Lock()
@@ -790,15 +826,19 @@ func (s *Service) evfLoop(ctx context.Context, frameCh chan<- []byte, stop <-cha
 			return
 
 		case <-ticker.C:
-			frame, err := grabEVFFrame(camera)
+			var frame []byte
+			err := s.postSDKTask(func() error {
+				var e error
+				frame, e = grabEVFFrame(camera)
+				return e
+			})
 			if err != nil {
 				if isRetryableEVFErr(err) {
-					continue // camera not ready yet; skip this frame
+					continue
 				}
 				cWarn("[evf] frame error: %v", err)
 				continue
 			}
-			// Non-blocking send: drop frame if HTTP handler is slow.
 			select {
 			case frameCh <- frame:
 			default:
@@ -809,17 +849,18 @@ func (s *Service) evfLoop(ctx context.Context, frameCh chan<- []byte, stop <-cha
 
 // startEVFMode enables EVF (live view) output to PC on the camera.
 func startEVFMode(camera C.EdsCameraRef) error {
-	// Some cameras require Evf_Mode=1 first; use setOptionalUInt32Property so
-	// cameras that don't support it still proceed.
 	evfMode := C.EdsUInt32(1)
-	_ = C.EdsSetPropertyData(
-		C.EdsBaseRef(camera),
-		C.kEdsPropID_Evf_Mode, 0,
-		C.EdsUInt32(unsafe.Sizeof(evfMode)),
-		unsafe.Pointer(&evfMode),
-	)
+	if err := edsCheck("EdsSetPropertyData(Evf_Mode)",
+		C.EdsSetPropertyData(
+			C.EdsBaseRef(camera),
+			C.kEdsPropID_Evf_Mode, 0,
+			C.EdsUInt32(unsafe.Sizeof(evfMode)),
+			unsafe.Pointer(&evfMode),
+		)); err != nil {
+		// Non-fatal: some cameras have EVF always enabled and reject this property.
+		cWarn("[evf] EdsSetPropertyData(Evf_Mode=1) failed (non-fatal): %v", err)
+	}
 
-	// Read current output device and OR in the PC flag.
 	var device C.EdsUInt32
 	if err := edsCheck("EdsGetPropertyData(Evf_OutputDevice)",
 		C.EdsGetPropertyData(
@@ -843,19 +884,26 @@ func startEVFMode(camera C.EdsCameraRef) error {
 // stopEVFMode removes the PC flag from Evf_OutputDevice, ending live view to PC.
 func stopEVFMode(camera C.EdsCameraRef) {
 	var device C.EdsUInt32
-	_ = C.EdsGetPropertyData(
-		C.EdsBaseRef(camera),
-		C.kEdsPropID_Evf_OutputDevice, 0,
-		C.EdsUInt32(unsafe.Sizeof(device)),
-		unsafe.Pointer(&device),
-	)
+	if err := edsCheck("EdsGetPropertyData(Evf_OutputDevice)",
+		C.EdsGetPropertyData(
+			C.EdsBaseRef(camera),
+			C.kEdsPropID_Evf_OutputDevice, 0,
+			C.EdsUInt32(unsafe.Sizeof(device)),
+			unsafe.Pointer(&device),
+		)); err != nil {
+		cWarn("[evf] stopEVFMode: EdsGetPropertyData(Evf_OutputDevice) failed: %v — EVF may remain active on camera", err)
+		return
+	}
 	device &^= C.kEdsEvfOutputDevice_PC
-	_ = C.EdsSetPropertyData(
-		C.EdsBaseRef(camera),
-		C.kEdsPropID_Evf_OutputDevice, 0,
-		C.EdsUInt32(unsafe.Sizeof(device)),
-		unsafe.Pointer(&device),
-	)
+	if err := edsCheck("EdsSetPropertyData(Evf_OutputDevice)",
+		C.EdsSetPropertyData(
+			C.EdsBaseRef(camera),
+			C.kEdsPropID_Evf_OutputDevice, 0,
+			C.EdsUInt32(unsafe.Sizeof(device)),
+			unsafe.Pointer(&device),
+		)); err != nil {
+		cWarn("[evf] stopEVFMode: EdsSetPropertyData(Evf_OutputDevice) failed: %v — EVF may remain active on camera", err)
+	}
 }
 
 // grabEVFFrame downloads one EVF frame and returns its JPEG bytes.
@@ -890,7 +938,6 @@ func grabEVFFrame(camera C.EdsCameraRef) ([]byte, error) {
 		return nil, fmt.Errorf("empty EVF frame")
 	}
 
-	// Copy bytes before stream is released.
 	frame := make([]byte, int(length))
 	copy(frame, (*[1 << 28]byte)(ptr)[:length:length])
 	return frame, nil
@@ -900,7 +947,6 @@ func isRetryableEVFErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	// Check if the underlying EDSDK error is a "not ready" / "busy" code.
 	msg := err.Error()
 	return containsAny(msg,
 		"EDS_ERR_OBJECT_NOTREADY",
@@ -923,13 +969,102 @@ func containsAny(s string, subs ...string) bool {
 }
 
 // ─────────────────────────────────────────────
-// Host file download
+// CGo callback entry points
 // ─────────────────────────────────────────────
 
-// downloadDirectoryItem downloads the camera file referenced by dirItem to the host
-// output directory and returns the local file path. It owns and releases dirItem.
-// Must be called from a goroutine with a COM STA context (e.g. the event pump).
-func (s *Service) downloadDirectoryItem(dirItem C.EdsDirectoryItemRef) (string, error) {
+// goObjectEventHandler is the C-callable entry point registered with EdsSetObjectEventHandler.
+// It is called by EDSDK on the SDK thread (via EdsGetEvent) and dispatches to the active service.
+//
+//export goObjectEventHandler
+func goObjectEventHandler(inEvent C.EdsObjectEvent, inRef C.EdsBaseRef, _ unsafe.Pointer) C.EdsError {
+	svc := activeService.Load()
+	if svc == nil {
+		cWarn("[event] goObjectEventHandler: activeService is nil, dropping event 0x%08X", uint32(inEvent))
+		if inRef != nil {
+			_ = C.EdsRelease(inRef)
+		}
+		return C.EDS_ERR_OK
+	}
+	return svc.onObjectEvent(inEvent, inRef)
+}
+
+// goCameraStateEventHandler is the C-callable entry point registered with EdsSetCameraStateEventHandler.
+// It is called by EDSDK on the SDK thread (via EdsGetEvent) and dispatches to the active service.
+//
+//export goCameraStateEventHandler
+func goCameraStateEventHandler(inEvent C.EdsStateEvent, inParameter C.EdsUInt32, _ unsafe.Pointer) C.EdsError {
+	svc := activeService.Load()
+	if svc == nil {
+		cWarn("[event] goCameraStateEventHandler: activeService is nil, dropping event 0x%08X", uint32(inEvent))
+		return C.EDS_ERR_OK
+	}
+	return svc.onStateEvent(inEvent, inParameter)
+}
+
+// ─────────────────────────────────────────────
+// Event handlers
+// ─────────────────────────────────────────────
+
+// onObjectEvent handles camera object events (called on the SDK thread via EdsGetEvent).
+func (s *Service) onObjectEvent(event C.EdsObjectEvent, ref C.EdsBaseRef) C.EdsError {
+	cDebug("[event] onObjectEvent: event=%s (0x%08X) ref=%v",
+		edsObjectEventName(event), uint32(event), ref != nil)
+
+	if ref == nil {
+		cWarn("[event] ref is nil, ignoring event")
+		return C.EDS_ERR_OK
+	}
+
+	if event == C.kEdsObjectEvent_DirItemCreated {
+		// SaveTo=Camera: camera wrote the photo to the SD card.
+		// Download it to the host captures folder, then delete it from the SD card.
+		dirItem := C.EdsDirectoryItemRef(ref)
+
+		suppressed := s.isTransferSuppressed()
+		cInfo("[event] DirItemCreated — isTransferSuppressed=%v", suppressed)
+		if suppressed {
+			cWarn("[event] suppressing stale DirItemCreated (preempt window active)")
+			releaseRef(ref)
+			return C.EDS_ERR_OK
+		}
+
+		path, err := s.downloadAndDeleteDirectoryItem(dirItem)
+		cDebug("[event] downloadAndDelete finished: path=%q err=%v", path, err)
+
+		s.mu.Lock()
+		req := s.pending
+		if req != nil {
+			s.pending = nil
+		}
+		s.mu.Unlock()
+
+		if req != nil {
+			cDebug("[event] notifying pending capture with download result")
+			notifyCaptureResult(req, captureResult{path: path, err: err})
+		} else if err == nil {
+			cWarn("[event] download complete but no pending capture to notify (path=%s) — capture() may have timed out", path)
+		}
+		return C.EDS_ERR_OK
+	}
+
+	if event == C.kEdsObjectEvent_DirItemRequestTransfer ||
+		event == C.kEdsObjectEvent_DirItemRequestTransferDT {
+		// Should not fire with SaveTo=Camera. Cancel so the camera doesn't stall.
+		cWarn("[event] unexpected DirItemRequestTransfer with SaveTo=Camera — cancelling")
+		_ = C.EdsDownloadCancel(C.EdsDirectoryItemRef(ref))
+		releaseRef(ref)
+		return C.EDS_ERR_OK
+	}
+
+	cDebug("[event] unhandled object event — releasing ref")
+	releaseRef(ref)
+	return C.EDS_ERR_OK
+}
+
+// downloadAndDeleteDirectoryItem downloads the file at dirItem to the host captures
+// folder, then deletes it from the camera's SD card. Owns and releases dirItem.
+// Must be called from the SDK thread.
+func (s *Service) downloadAndDeleteDirectoryItem(dirItem C.EdsDirectoryItemRef) (string, error) {
 	var info C.EdsDirectoryItemInfo
 	if err := edsCheck("EdsGetDirectoryItemInfo",
 		C.EdsGetDirectoryItemInfo(dirItem, &info)); err != nil {
@@ -965,86 +1100,39 @@ func (s *Service) downloadDirectoryItem(dirItem C.EdsDirectoryItemRef) (string, 
 	cDebug("[download] calling EdsDownload (size=%d bytes)", uint64(info.size))
 	if err := edsCheck("EdsDownload",
 		C.EdsDownload(dirItem, C.EdsUInt64(info.size), stream)); err != nil {
-		cError("[download] EdsDownload failed: %v", err)
+		cError("[download] EdsDownload failed for %q: %v — cancelling transfer and removing partial file", destPath, err)
 		_ = C.EdsDownloadCancel(dirItem)
 		releaseRef(C.EdsBaseRef(dirItem))
-		return "", fmt.Errorf("download: %w", err)
+		if removeErr := os.Remove(destPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			cWarn("[download] failed to remove partial file %q: %v", destPath, removeErr)
+		}
+		return "", fmt.Errorf("download %q: %w", fileName, err)
 	}
 	cDebug("[download] EdsDownload OK")
 
 	cDebug("[download] calling EdsDownloadComplete")
 	if err := edsCheck("EdsDownloadComplete",
 		C.EdsDownloadComplete(dirItem)); err != nil {
-		cError("[download] EdsDownloadComplete failed: %v", err)
+		cError("[download] EdsDownloadComplete failed for %q: %v — cancelling transfer and removing partial file", destPath, err)
+		_ = C.EdsDownloadCancel(dirItem)
 		releaseRef(C.EdsBaseRef(dirItem))
-		return "", fmt.Errorf("download complete: %w", err)
+		if removeErr := os.Remove(destPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			cWarn("[download] failed to remove partial file %q: %v", destPath, removeErr)
+		}
+		return "", fmt.Errorf("download complete %q: %w", fileName, err)
 	}
 	cInfo("[download] EdsDownloadComplete OK — file saved to %s", destPath)
 
+	cDebug("[download] deleting file from SD card")
+	if err := edsCheck("EdsDeleteDirectoryItem",
+		C.EdsDeleteDirectoryItem(dirItem)); err != nil {
+		cWarn("[download] EdsDeleteDirectoryItem failed (non-fatal): %v", err)
+	} else {
+		cInfo("[download] file deleted from SD card")
+	}
+
 	releaseRef(C.EdsBaseRef(dirItem))
 	return destPath, nil
-}
-
-// ─────────────────────────────────────────────
-// Event handlers
-// ─────────────────────────────────────────────
-
-// onObjectEvent handles camera object events.
-// With SaveTo=Host, DirItemRequestTransfer fires when the photo is ready to pull.
-// This callback runs on the event pump goroutine, which already holds a COM STA
-// thread — exactly what EDSDK requires. We call EdsDownload directly here, as
-// shown in the EDSDK sample code (Section 6.3).
-func (s *Service) onObjectEvent(event C.EdsObjectEvent, ref C.EdsBaseRef) C.EdsError {
-	cDebug("[event] onObjectEvent: event=%s (0x%08X) ref=%v",
-		edsObjectEventName(event), uint32(event), ref != nil)
-
-	if ref == nil {
-		cWarn("[event] ref is nil, ignoring event")
-		return C.EDS_ERR_OK
-	}
-
-	if event == C.kEdsObjectEvent_DirItemRequestTransfer ||
-		event == C.kEdsObjectEvent_DirItemRequestTransferDT {
-
-		dirItem := C.EdsDirectoryItemRef(ref)
-		suppressed := s.isTransferSuppressed()
-		cInfo("[event] DirItemRequestTransfer received — isTransferSuppressed=%v", suppressed)
-
-		if suppressed {
-			cWarn("[event] suppressing stale transfer request (suppressTransfersUntil window active)")
-			_ = C.EdsDownloadCancel(dirItem)
-			releaseRef(ref)
-			return C.EDS_ERR_OK
-		}
-
-		s.mu.Lock()
-		hasPending := s.pending != nil
-		s.mu.Unlock()
-		cDebug("[event] hasPendingCapture=%v — starting download", hasPending)
-
-		// Download directly on this goroutine — no extra thread needed.
-		path, err := s.downloadDirectoryItem(dirItem)
-		cDebug("[event] download finished: path=%q err=%v", path, err)
-
-		s.mu.Lock()
-		req := s.pending
-		if req != nil {
-			s.pending = nil
-		}
-		s.mu.Unlock()
-
-		if req != nil {
-			cDebug("[event] notifying pending capture request with result")
-			notifyCaptureResult(req, captureResult{path: path, err: err})
-		} else if err == nil {
-			cWarn("[event] download complete but NO pending request to notify (path=%s) — capture() may have already timed out", path)
-		}
-		return C.EDS_ERR_OK
-	}
-
-	cDebug("[event] unhandled object event — releasing ref")
-	releaseRef(ref)
-	return C.EDS_ERR_OK
 }
 
 // edsObjectEventName maps an EdsObjectEvent to a human-readable name.
@@ -1081,9 +1169,7 @@ func edsObjectEventName(event C.EdsObjectEvent) string {
 	}
 }
 
-// onStateEvent handles camera state changes.
-// JobStatusChanged with inParameter==0 means the camera finished its current job.
-// Shutdown means the camera was physically disconnected.
+// onStateEvent handles camera state changes (called on the SDK thread via EdsGetEvent).
 func (s *Service) onStateEvent(event C.EdsStateEvent, inParameter C.EdsUInt32) C.EdsError {
 	cDebug("[event] onStateEvent: event=%s (0x%08X) param=0x%08X",
 		edsStateEventName(event), uint32(event), uint32(inParameter))
@@ -1097,8 +1183,6 @@ func (s *Service) onStateEvent(event C.EdsStateEvent, inParameter C.EdsUInt32) C
 		s.cameraDisconnected = true
 		pending := s.pending
 		s.pending = nil
-		// Cancel EVF context so evfLoop takes the ctx.Done() path, which closes
-		// frameCh and signals HTTP preview clients to stop cleanly.
 		evfCancel := s.evfCancel
 		s.mu.Unlock()
 
@@ -1110,7 +1194,6 @@ func (s *Service) onStateEvent(event C.EdsStateEvent, inParameter C.EdsUInt32) C
 			notifyCaptureResult(pending, captureResult{err: domain.ErrCameraDisconnected})
 		}
 		activeService.CompareAndSwap(s, nil)
-		// Signal ReconnectingService (or any other waiter) that reconnect can begin.
 		s.disconnectedOnce.Do(func() { close(s.disconnectedCh) })
 
 	case C.kEdsStateEvent_JobStatusChanged:
@@ -1163,10 +1246,10 @@ func edsStateEventName(event C.EdsStateEvent) string {
 // Camera configuration
 // ─────────────────────────────────────────────
 
-// configureCamera sets SaveTo=Host (so we receive DirItemRequestTransfer) and
-// optionally disables flash. EdsSetCapacity is required when SaveTo=Host.
+// configureCamera sets SaveTo=Camera (photo written to SD card) and optionally
+// disables flash. With SaveTo=Camera, no EdsSetCapacity is needed and no
+// DirItemRequestTransfer event fires — completion is signalled by JobStatusChanged.
 func configureCamera(camera C.EdsCameraRef) error {
-	// Read current SaveTo before changing it.
 	var saveToBeforeSet C.EdsUInt32
 	readErr := C.EdsGetPropertyData(
 		C.EdsBaseRef(camera),
@@ -1182,8 +1265,8 @@ func configureCamera(camera C.EdsCameraRef) error {
 		cWarn("[config] could not read current SaveTo: %s (0x%08X)", edsErrName(readErr), uint32(readErr))
 	}
 
-	cInfo("[config] setting SaveTo=Host (kEdsSaveTo_Host=0x%08X)", uint32(C.kEdsSaveTo_Host))
-	saveTo := C.EdsUInt32(C.kEdsSaveTo_Host)
+	cInfo("[config] setting SaveTo=Camera (kEdsSaveTo_Camera=0x%08X)", uint32(C.kEdsSaveTo_Camera))
+	saveTo := C.EdsUInt32(C.kEdsSaveTo_Camera)
 	if err := edsCheck("EdsSetPropertyData(SaveTo)", C.EdsSetPropertyData(
 		C.EdsBaseRef(camera),
 		C.kEdsPropID_SaveTo,
@@ -1191,9 +1274,8 @@ func configureCamera(camera C.EdsCameraRef) error {
 		C.EdsUInt32(unsafe.Sizeof(saveTo)),
 		unsafe.Pointer(&saveTo),
 	)); err != nil {
-		cWarn("[config] SaveTo=Host not applied: %v", err)
+		cWarn("[config] SaveTo=Camera not applied: %v", err)
 	} else {
-		// Read back to confirm it was applied.
 		var saveToAfterSet C.EdsUInt32
 		readBackErr := C.EdsGetPropertyData(
 			C.EdsBaseRef(camera),
@@ -1203,27 +1285,14 @@ func configureCamera(camera C.EdsCameraRef) error {
 			unsafe.Pointer(&saveToAfterSet),
 		)
 		if readBackErr == C.EDS_ERR_OK {
-			cInfo("[config] SaveTo AFTER set: %s (0x%08X) — expected Host (0x%08X)",
-				saveToName(saveToAfterSet), uint32(saveToAfterSet), uint32(C.kEdsSaveTo_Host))
-			if saveToAfterSet != C.EdsUInt32(C.kEdsSaveTo_Host) {
-				cWarn("[config] SaveTo readback mismatch! Camera may save to SD card instead of host — DirItemRequestTransfer will NOT fire")
+			cInfo("[config] SaveTo AFTER set: %s (0x%08X) — expected Camera (0x%08X)",
+				saveToName(saveToAfterSet), uint32(saveToAfterSet), uint32(C.kEdsSaveTo_Camera))
+			if saveToAfterSet != C.EdsUInt32(C.kEdsSaveTo_Camera) {
+				cWarn("[config] SaveTo readback mismatch! Camera may not save to SD card")
 			}
 		} else {
-			cWarn("[config] SaveTo=Host set returned OK but readback failed: %s (0x%08X)", edsErrName(readBackErr), uint32(readBackErr))
+			cWarn("[config] SaveTo readback failed: %s (0x%08X)", edsErrName(readBackErr), uint32(readBackErr))
 		}
-	}
-
-	// EdsSetCapacity is required for SaveTo=Host or the camera may report busy.
-	cInfo("[config] setting EdsSetCapacity (required for SaveTo=Host)")
-	cap := C.EdsCapacity{
-		numberOfFreeClusters: C.EdsInt32(0x7FFFFFFF),
-		bytesPerSector:       C.EdsInt32(0x1000),
-		reset:                C.EdsBool(1),
-	}
-	if err := edsCheck("EdsSetCapacity", C.EdsSetCapacity(camera, cap)); err != nil {
-		cWarn("[config] EdsSetCapacity failed: %v — host transfer may fail", err)
-	} else {
-		cInfo("[config] EdsSetCapacity OK")
 	}
 
 	if !flashConfigEnabled() {
@@ -1248,7 +1317,7 @@ func saveToName(v C.EdsUInt32) string {
 	}
 }
 
-// configureNoFlash aplica FlashOn=0 si la cámara lo soporta.
+// configureNoFlash applies FlashOn=0 if the camera supports it.
 func configureNoFlash(camera C.EdsCameraRef) error {
 	return setOptionalUInt32Property(camera, "FlashOn=0", C.kEdsPropID_FlashOn, C.EdsUInt32(0))
 }
@@ -1257,15 +1326,17 @@ func configureNoFlash(camera C.EdsCameraRef) error {
 // Service lifecycle
 // ─────────────────────────────────────────────
 
-// Close detiene el event pump, notifica captura pendiente como cancelada y cierra sesión/SDK.
+// Close stops the SDK thread (which closes the session and releases the SDK) and
+// waits for all background goroutines to finish.
 func (s *Service) Close() error {
 	s.closeOnce.Do(func() {
 		cInfo("[close] Service.Close called")
 		activeService.CompareAndSwap(s, nil)
 
-		// Stop EVF first so the camera gets the stop command before the session closes.
+		// Stop EVF so the camera gets the stop command before the session closes.
 		s.StopPreview()
 
+		// Signal the SDK thread to close the session and release the SDK.
 		close(s.stopEventPump)
 		<-s.eventPumpDone
 
@@ -1273,7 +1344,6 @@ func (s *Service) Close() error {
 		s.closed = true
 		pending := s.pending
 		s.pending = nil
-		camera := s.camera
 		s.mu.Unlock()
 
 		if pending != nil {
@@ -1281,83 +1351,21 @@ func (s *Service) Close() error {
 		}
 
 		s.bgWg.Wait()
-
-		s.mu.Lock()
-		disconnected := s.cameraDisconnected
-		s.mu.Unlock()
-
-		var errs []error
-		if err := withPlatformThreading(func() error {
-			var closeErr error
-			if !disconnected {
-				// Camera still connected: close the session gracefully.
-				closeErr = edsCheck("EdsCloseSession", C.EdsCloseSession(camera))
-				releaseRef(C.EdsBaseRef(camera))
-			}
-			// Decrement SDK ref count; terminates EDSDK when it reaches zero.
-			releaseSDK()
-			return closeErr
-		}); err != nil {
-			errs = append(errs, err)
-		}
-		if len(errs) > 0 {
-			s.closeErr = errors.Join(errs...)
-		}
-		cInfo("[close] Service.Close complete err=%v", s.closeErr)
+		cInfo("[close] Service.Close complete")
 	})
 	return s.closeErr
 }
 
-// Disconnected returns a channel that is closed when the camera fires a shutdown event
-// (USB unplugged). Callers can select on it to detect disconnection without polling.
+// Disconnected returns a channel that is closed when the camera fires a shutdown event.
 func (s *Service) Disconnected() <-chan struct{} {
 	return s.disconnectedCh
-}
-
-// startEventPump runs EdsGetEvent on a dedicated OS thread (COM STA) so that
-// EDSDK callbacks fire correctly. The shutter goroutine runs on its own STA
-// thread via withPlatformThreading, so this goroutine only pumps events.
-func (s *Service) startEventPump() {
-	go func() {
-		SetGoroutineRole("pump")
-		defer close(s.eventPumpDone)
-
-		uninitThreading, err := initPlatformThreading()
-		if err != nil {
-			cError("[pump] threading initialization failed: %v", err)
-			return
-		}
-		defer uninitThreading()
-
-		ticker := time.NewTicker(20 * time.Millisecond)
-		defer ticker.Stop()
-
-		var pumpCalls uint64
-
-		for {
-			select {
-			case <-s.stopEventPump:
-				return
-
-			case <-ticker.C:
-				pumpCalls++
-				result := C.EdsGetEvent()
-				if pumpCalls%500 == 0 {
-					cDebug("[pump] heartbeat: %d EdsGetEvent calls", pumpCalls)
-				}
-				if result != C.EDS_ERR_OK {
-					cWarn("[pump] EdsGetEvent returned %s (0x%08X)", edsErrName(result), uint32(result))
-				}
-			}
-		}
-	}()
 }
 
 // ─────────────────────────────────────────────
 // Camera discovery
 // ─────────────────────────────────────────────
 
-// waitForFirstCamera hace polling de la lista de cámaras hasta obtener una o superar timeout.
+// waitForFirstCamera polls the camera list until a camera appears or timeout elapses.
 func waitForFirstCamera(timeout time.Duration) (C.EdsBaseRef, error) {
 	deadline := time.Now().Add(timeout)
 	attempt := 0
@@ -1392,7 +1400,7 @@ func waitForFirstCamera(timeout time.Duration) (C.EdsBaseRef, error) {
 	}
 }
 
-// firstCameraRefAndCount devuelve la primera cámara de la lista y el total de cámaras.
+// firstCameraRefAndCount returns the first camera from the list and the total count.
 func firstCameraRefAndCount() (C.EdsBaseRef, uint32, error) {
 	var cameraList C.EdsCameraListRef
 	if err := edsCheck("EdsGetCameraList", C.EdsGetCameraList(&cameraList)); err != nil {
@@ -1415,7 +1423,7 @@ func firstCameraRefAndCount() (C.EdsBaseRef, uint32, error) {
 	return cameraBase, uint32(count), nil
 }
 
-// openSessionWithRetry abre sesión EDSDK con reintentos ante DEVICE_BUSY / OBJECT_NOTREADY.
+// openSessionWithRetry opens the EDSDK session with retries on DEVICE_BUSY / OBJECT_NOTREADY.
 func openSessionWithRetry(camera C.EdsCameraRef) error {
 	const attempts = 8
 	var last C.EdsError
@@ -1587,7 +1595,6 @@ func isIgnorablePropertyErr(code C.EdsError) bool {
 // EDS error helpers
 // ─────────────────────────────────────────────
 
-// edsCheck convierte un código EDS en error Go con nombre y hint si aplica.
 func edsCheck(op string, code C.EdsError) error {
 	if code == C.EDS_ERR_OK {
 		return nil
@@ -1611,22 +1618,30 @@ func edsErrName(code C.EdsError) string {
 		return "EDS_ERR_COMM_PORT_IS_IN_USE"
 	case uint32(C.EDS_ERR_COMM_DISCONNECTED):
 		return "EDS_ERR_COMM_DISCONNECTED"
-	case uint32(C.EDS_ERR_SESSION_NOT_OPEN):
-		return "EDS_ERR_SESSION_NOT_OPEN"
 	case uint32(C.EDS_ERR_OBJECT_NOTREADY):
 		return "EDS_ERR_OBJECT_NOTREADY"
-	case uint32(C.EDS_ERR_TAKE_PICTURE_AF_NG):
-		return "EDS_ERR_TAKE_PICTURE_AF_NG"
-	case uint32(C.EDS_ERR_INTERNAL_ERROR):
-		return "EDS_ERR_INTERNAL_ERROR"
-	case uint32(C.EDS_ERR_MEM_ALLOC_FAILED):
-		return "EDS_ERR_MEM_ALLOC_FAILED"
-	case uint32(C.EDS_ERR_INVALID_HANDLE):
-		return "EDS_ERR_INVALID_HANDLE"
-	case uint32(C.EDS_ERR_INVALID_PARAMETER):
-		return "EDS_ERR_INVALID_PARAMETER"
+	case uint32(C.EDS_ERR_PROPERTIES_NOT_LOADED):
+		return "EDS_ERR_PROPERTIES_NOT_LOADED"
 	case uint32(C.EDS_ERR_NOT_SUPPORTED):
 		return "EDS_ERR_NOT_SUPPORTED"
+	case uint32(C.EDS_ERR_PROPERTIES_UNAVAILABLE):
+		return "EDS_ERR_PROPERTIES_UNAVAILABLE"
+	case uint32(C.EDS_ERR_PROPERTIES_MISMATCH):
+		return "EDS_ERR_PROPERTIES_MISMATCH"
+	case uint32(C.EDS_ERR_INVALID_PARAMETER):
+		return "EDS_ERR_INVALID_PARAMETER"
+	case uint32(C.EDS_ERR_DEVICE_INVALID_PARAMETER):
+		return "EDS_ERR_DEVICE_INVALID_PARAMETER"
+	case uint32(C.EDS_ERR_DEVICEPROP_NOT_SUPPORTED):
+		return "EDS_ERR_DEVICEPROP_NOT_SUPPORTED"
+	case uint32(C.EDS_ERR_INVALID_DEVICEPROP_FORMAT):
+		return "EDS_ERR_INVALID_DEVICEPROP_FORMAT"
+	case uint32(C.EDS_ERR_INVALID_DEVICEPROP_VALUE):
+		return "EDS_ERR_INVALID_DEVICEPROP_VALUE"
+	case uint32(C.EDS_ERR_PTP_DEVICE_BUSY):
+		return "EDS_ERR_PTP_DEVICE_BUSY"
+	case uint32(C.EDS_ERR_INTERNAL_ERROR):
+		return "EDS_ERR_INTERNAL_ERROR"
 	default:
 		return fmt.Sprintf("EDS_ERR_0x%08X", uint32(code))
 	}
@@ -1635,47 +1650,19 @@ func edsErrName(code C.EdsError) string {
 func edsErrHint(code C.EdsError) string {
 	switch uint32(code) {
 	case uint32(C.EDS_ERR_COMM_PORT_IS_IN_USE):
-		return "another app is connected to the camera; close EOS Utility/Canon apps/webcam tools and reconnect USB"
-	case uint32(C.EDS_ERR_DEVICE_BUSY), uint32(C.EDS_ERR_OBJECT_NOTREADY):
-		return "camera is busy; wait a few seconds and retry"
-	case uint32(C.EDS_ERR_TAKE_PICTURE_AF_NG):
-		return "focus was not confirmed; switch to manual focus or improve focus/lighting"
+		return "close EOS Utility or other Canon apps"
+	case uint32(C.EDS_ERR_DEVICE_BUSY):
+		return "camera is busy; retry shortly"
+	case uint32(C.EDS_ERR_COMM_DISCONNECTED):
+		return "USB disconnected"
 	default:
 		return ""
 	}
 }
 
-// withPlatformThreading is moved to threading_*.go
-// initPlatformThreading is moved to threading_*.go
-
-// releaseRef libera una referencia EDS con EdsRelease.
+// releaseRef wraps EdsRelease for any EdsBaseRef.
 func releaseRef(ref C.EdsBaseRef) {
 	if ref != nil {
 		_ = C.EdsRelease(ref)
 	}
-}
-
-// ─────────────────────────────────────────────
-// CGo exports
-// ─────────────────────────────────────────────
-
-//export goObjectEventHandler
-func goObjectEventHandler(inEvent C.EdsObjectEvent, inRef C.EdsBaseRef, _ unsafe.Pointer) C.EdsError {
-	svc := activeService.Load()
-	if svc == nil {
-		cWarn("[event] goObjectEventHandler: activeService is nil, dropping event 0x%08X", uint32(inEvent))
-		releaseRef(inRef)
-		return C.EDS_ERR_OK
-	}
-	return svc.onObjectEvent(inEvent, inRef)
-}
-
-//export goCameraStateEventHandler
-func goCameraStateEventHandler(inEvent C.EdsStateEvent, inParameter C.EdsUInt32, _ unsafe.Pointer) C.EdsError {
-	svc := activeService.Load()
-	if svc == nil {
-		cWarn("[event] goCameraStateEventHandler: activeService is nil, dropping event 0x%08X", uint32(inEvent))
-		return C.EDS_ERR_OK
-	}
-	return svc.onStateEvent(inEvent, inParameter)
 }
