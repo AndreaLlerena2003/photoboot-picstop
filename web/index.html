@@ -3,10 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Photoboot-Picstop | Live Preview</title>
+    <title>Picstop Photobooth</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
             --primary: #ff3e00;
@@ -14,13 +14,10 @@
             --bg: #0f172a;
             --card: rgba(30, 41, 59, 0.7);
             --text: #f8fafc;
+            --muted: #94a3b8;
         }
 
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
 
         body {
             font-family: 'Outfit', sans-serif;
@@ -31,7 +28,7 @@
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            overflow: hidden;
+            padding: 1.5rem;
         }
 
         .container {
@@ -39,28 +36,30 @@
             max-width: 1000px;
             backdrop-filter: blur(12px);
             background: var(--card);
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255,255,255,0.1);
             border-radius: 24px;
             padding: 2rem;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);
             text-align: center;
             animation: fadeIn 0.8s ease-out;
         }
 
         h1 {
-            font-weight: 600;
-            font-size: 2.5rem;
-            margin-bottom: 0.5rem;
+            font-weight: 700;
+            font-size: 2.2rem;
+            margin-bottom: 0.3rem;
             background: linear-gradient(to right, #f8fafc, #94a3b8);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
 
-        p {
-            color: #94a3b8;
-            margin-bottom: 2rem;
+        .subtitle {
+            color: var(--muted);
+            font-size: 0.95rem;
+            margin-bottom: 1.5rem;
         }
 
+        /* ── Preview section ── */
         .preview-wrapper {
             position: relative;
             width: 100%;
@@ -68,12 +67,7 @@
             background: #000;
             border-radius: 16px;
             overflow: hidden;
-            border: 4px solid rgba(255, 255, 255, 0.05);
-            transition: transform 0.3s ease;
-        }
-
-        .preview-wrapper:hover {
-            transform: scale(1.01);
+            border: 4px solid rgba(255,255,255,0.05);
         }
 
         #preview {
@@ -82,122 +76,501 @@
             object-fit: cover;
         }
 
-        .controls {
-            margin-top: 2rem;
+        /* Countdown overlay */
+        .overlay {
+            position: absolute;
+            inset: 0;
             display: flex;
-            gap: 1rem;
+            flex-direction: column;
+            align-items: center;
             justify-content: center;
+            background: rgba(0,0,0,0.55);
+            pointer-events: none;
+        }
+
+        .overlay.hidden { display: none; }
+
+        .photo-label {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: rgba(255,255,255,0.7);
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            margin-bottom: 0.5rem;
+        }
+
+        .countdown-number {
+            font-size: 10rem;
+            font-weight: 700;
+            line-height: 1;
+            color: #fff;
+            text-shadow: 0 0 40px rgba(255,255,255,0.5);
+            animation: countPop 0.25s ease-out;
+        }
+
+        @keyframes countPop {
+            from { transform: scale(1.4); opacity: 0.4; }
+            to   { transform: scale(1);   opacity: 1; }
+        }
+
+        /* Flash overlay */
+        .flash-overlay {
+            position: absolute;
+            inset: 0;
+            background: #fff;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.05s ease;
+        }
+
+        .flash-overlay.active { opacity: 1; }
+
+        /* Progress dots */
+        .progress-bar {
+            display: flex;
+            justify-content: center;
+            gap: 0.6rem;
+            margin: 1.2rem 0 0.8rem;
+        }
+
+        .progress-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: rgba(255,255,255,0.15);
+            border: 2px solid rgba(255,255,255,0.25);
+            transition: all 0.3s ease;
+        }
+
+        .progress-dot.done {
+            background: var(--primary);
+            border-color: var(--primary);
+            box-shadow: 0 0 10px rgba(255,62,0,0.5);
+        }
+
+        .progress-dot.active {
+            background: rgba(255,255,255,0.5);
+            border-color: rgba(255,255,255,0.8);
+            animation: pulse 0.8s infinite;
+        }
+
+        /* ── Strip section ── */
+        #strip-section {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .strip-frame {
+            background: #fff;
+            border-radius: 12px;
+            padding: 16px 16px 36px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+            display: inline-block;
+        }
+
+        #strip-canvas {
+            display: block;
+            /* Show at a fixed display width; download captures full res */
+            width: 260px;
+            height: auto;
+            border-radius: 4px;
+        }
+
+        .strip-label {
+            font-size: 0.7rem;
+            font-weight: 600;
+            letter-spacing: 0.15em;
+            color: #aaa;
+            text-align: center;
+            margin-top: 8px;
+            text-transform: uppercase;
+        }
+
+        /* ── Controls ── */
+        .controls {
+            margin-top: 1.5rem;
+            display: flex;
+            gap: 0.8rem;
+            justify-content: center;
+            flex-wrap: wrap;
         }
 
         button {
-            padding: 0.8rem 2rem;
+            padding: 0.75rem 1.75rem;
             border-radius: 12px;
             border: none;
             font-family: inherit;
+            font-size: 0.95rem;
             font-weight: 600;
             cursor: pointer;
             transition: all 0.2s ease;
         }
 
-        .btn-primary {
-            background: var(--primary);
-            color: white;
-            box-shadow: 0 4px 14px 0 rgba(255, 62, 0, 0.39);
+        button:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+            transform: none !important;
         }
 
-        .btn-primary:hover {
-            background: #e63700;
-            transform: translateY(-2px);
+        .btn-primary {
+            background: var(--primary);
+            color: #fff;
+            box-shadow: 0 4px 14px rgba(255,62,0,0.4);
         }
+        .btn-primary:not(:disabled):hover { background: #e63700; transform: translateY(-2px); }
+
+        .btn-accent {
+            background: var(--accent);
+            color: #fff;
+            box-shadow: 0 4px 14px rgba(79,172,238,0.35);
+        }
+        .btn-accent:not(:disabled):hover { background: #3d9cd8; transform: translateY(-2px); }
 
         .btn-outline {
             background: transparent;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            color: white;
+            border: 1px solid rgba(255,255,255,0.2);
+            color: #fff;
         }
+        .btn-outline:not(:disabled):hover { background: rgba(255,255,255,0.06); }
 
-        .btn-outline:hover {
-            background: rgba(255, 255, 255, 0.05);
-        }
-
-        .status {
-            display: inline-flex;
+        /* ── Status bar ── */
+        .status-bar {
+            display: flex;
             align-items: center;
+            justify-content: center;
             gap: 0.5rem;
-            margin-top: 1.5rem;
-            font-size: 0.9rem;
-            color: #10b981;
+            margin-top: 1.2rem;
+            font-size: 0.85rem;
+            color: var(--muted);
+            min-height: 1.4rem;
         }
 
         .dot {
-            width: 8px;
-            height: 8px;
+            width: 8px; height: 8px;
             background: #10b981;
             border-radius: 50%;
             box-shadow: 0 0 10px #10b981;
             animation: pulse 1.5s infinite;
+            flex-shrink: 0;
         }
 
+        .dot.busy { background: var(--primary); box-shadow: 0 0 10px var(--primary); }
+        .dot.warn { background: #f59e0b; box-shadow: 0 0 10px #f59e0b; animation: none; }
+
         @keyframes pulse {
-            0% {
-                opacity: 0.4;
-            }
-            50% {
-                opacity: 1;
-            }
-            100% {
-                opacity: 0.4;
-            }
+            0%,100% { opacity: 0.4; }
+            50% { opacity: 1; }
         }
 
         @keyframes fadeIn {
-            from {
-                opacity: 0;
-                transform: translateY(20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
+            from { opacity: 0; transform: translateY(20px); }
+            to   { opacity: 1; transform: translateY(0); }
         }
     </style>
 </head>
 <body>
 <div class="container">
-    <h1>Live Preview</h1>
-    <p>Real-time Canon EVF stream connected via Picstop Service</p>
+    <h1>Picstop Photobooth</h1>
+    <p class="subtitle">Canon DSLR · 3 photos · instant strip</p>
 
-    <div class="preview-wrapper">
+    <!-- Live preview -->
+    <div class="preview-wrapper" id="preview-section">
         <img id="preview" src="/preview" alt="Connecting to camera...">
+
+        <!-- Countdown overlay -->
+        <div class="overlay hidden" id="countdown-overlay">
+            <div class="photo-label">Photo <span id="photo-num">1</span> of 3</div>
+            <div class="countdown-number" id="countdown-num">3</div>
+        </div>
+
+        <!-- White flash -->
+        <div class="flash-overlay" id="flash-overlay"></div>
     </div>
 
-    <div class="controls">
-        <button class="btn-primary" onclick="capture()">Capture Photo</button>
-        <button class="btn-outline" onclick="togglePreview()">Toggle Feed</button>
+    <!-- Strip result (hidden until complete) -->
+    <div id="strip-section">
+        <div class="strip-frame">
+            <canvas id="strip-canvas"></canvas>
+            <div class="strip-label">Picstop&nbsp;&nbsp;·&nbsp;&nbsp;<span id="strip-date"></span></div>
+        </div>
     </div>
 
-    <div class="status">
-        <span class="dot"></span>
-        Live Connection Active
+    <!-- Progress dots (hidden in idle/strip states) -->
+    <div class="progress-bar" id="progress-bar" style="display:none">
+        <div class="progress-dot" id="dot-0"></div>
+        <div class="progress-dot" id="dot-1"></div>
+        <div class="progress-dot" id="dot-2"></div>
+    </div>
+
+    <!-- Controls -->
+    <div class="controls" id="controls">
+        <button class="btn-primary"  id="btn-start"    onclick="startPhotobooth()">Start Photobooth</button>
+        <button class="btn-outline"  id="btn-single"   onclick="captureSingle()">Single Photo</button>
+        <button class="btn-outline"  id="btn-toggle"   onclick="toggleFeed()">Toggle Feed</button>
+        <button class="btn-accent"   id="btn-download" onclick="downloadStrip()" style="display:none">⬇ Download Strip</button>
+        <button class="btn-outline"  id="btn-restart"  onclick="restart()"       style="display:none">Try Again</button>
+    </div>
+
+    <div class="status-bar">
+        <span class="dot" id="status-dot"></span>
+        <span id="status-text">Live — ready to shoot</span>
     </div>
 </div>
 
 <script>
-    function capture() {
-        fetch('/capture', {method: 'POST'})
-            .then(r => r.json())
-            .then(data => alert('Photo saved to: ' + data.path))
-            .catch(e => console.error('Capture failed', e));
+    // ── Config ────────────────────────────────────────────────────────────
+    const COUNTDOWN_SEC  = 3;   // seconds of countdown before each shot
+    const BETWEEN_MS     = 1200; // pause between shots (ms)
+    const FLASH_MS       = 280;  // white flash duration (ms)
+    const STRIP_PAD      = 32;   // strip canvas outer padding (px)
+    const STRIP_GAP      = 16;   // gap between photos in strip (px)
+
+    // ── State ─────────────────────────────────────────────────────────────
+    let running  = false;
+    let captured = [];   // { url, img } per shot
+
+    // ── DOM refs ─────────────────────────────────────────────────────────
+    const previewSection   = document.getElementById('preview-section');
+    const stripSection     = document.getElementById('strip-section');
+    const countdownOverlay = document.getElementById('countdown-overlay');
+    const flashOverlay     = document.getElementById('flash-overlay');
+    const countdownNum     = document.getElementById('countdown-num');
+    const photoNumEl       = document.getElementById('photo-num');
+    const progressBar      = document.getElementById('progress-bar');
+    const dots             = [0,1,2].map(i => document.getElementById('dot-'+i));
+    const statusDot        = document.getElementById('status-dot');
+    const statusText       = document.getElementById('status-text');
+    const btnStart         = document.getElementById('btn-start');
+    const btnSingle        = document.getElementById('btn-single');
+    const btnToggle        = document.getElementById('btn-toggle');
+    const btnDownload      = document.getElementById('btn-download');
+    const btnRestart       = document.getElementById('btn-restart');
+    const stripCanvas      = document.getElementById('strip-canvas');
+    const stripDate        = document.getElementById('strip-date');
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    function setStatus(msg, dotClass = '') {
+        statusText.textContent = msg;
+        statusDot.className = 'dot' + (dotClass ? ' ' + dotClass : '');
     }
 
-    function togglePreview() {
+    function setButtonsIdle() {
+        btnStart.disabled    = false;
+        btnSingle.disabled   = false;
+        btnToggle.disabled   = false;
+        btnDownload.style.display = 'none';
+        btnRestart.style.display  = 'none';
+        btnStart.style.display    = '';
+        btnSingle.style.display   = '';
+        btnToggle.style.display   = '';
+    }
+
+    function setButtonsRunning() {
+        btnStart.disabled  = true;
+        btnSingle.disabled = true;
+        btnToggle.disabled = true;
+    }
+
+    function setButtonsStrip() {
+        btnStart.style.display    = 'none';
+        btnSingle.style.display   = 'none';
+        btnToggle.style.display   = 'none';
+        btnDownload.style.display = '';
+        btnRestart.style.display  = '';
+    }
+
+    function setDot(index, state) {
+        // state: '' | 'active' | 'done'
+        dots.forEach((d, i) => {
+            d.className = 'progress-dot' + (i === index ? (state ? ' ' + state : '') : (i < index ? ' done' : ''));
+        });
+    }
+
+    function loadImage(url) {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload  = () => resolve(img);
+            img.onerror = () => reject(new Error('Failed to load image: ' + url));
+            img.src = url;
+        });
+    }
+
+    // ── Countdown ─────────────────────────────────────────────────────────
+    async function runCountdown(photoIndex) {
+        photoNumEl.textContent = photoIndex + 1;
+        countdownOverlay.classList.remove('hidden');
+
+        for (let n = COUNTDOWN_SEC; n >= 1; n--) {
+            countdownNum.textContent = n;
+            // Force reflow to restart animation on each number change
+            countdownNum.style.animation = 'none';
+            countdownNum.offsetHeight; // eslint-disable-line no-unused-expressions
+            countdownNum.style.animation = '';
+            await sleep(1000);
+        }
+
+        countdownOverlay.classList.add('hidden');
+    }
+
+    // ── Flash ─────────────────────────────────────────────────────────────
+    async function triggerFlash() {
+        flashOverlay.classList.add('active');
+        await sleep(FLASH_MS);
+        flashOverlay.classList.remove('active');
+    }
+
+    // ── Single capture API call ───────────────────────────────────────────
+    async function doCapture() {
+        const resp = await fetch('/capture', { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok || !data.url) {
+            throw new Error(data.error || 'Capture failed (HTTP ' + resp.status + ')');
+        }
+        return data.url;
+    }
+
+    // ── Photobooth flow ───────────────────────────────────────────────────
+    async function startPhotobooth() {
+        if (running) return;
+        running  = true;
+        captured = [];
+
+        setButtonsRunning();
+        stripSection.style.display = 'none';
+        previewSection.style.display = '';
+        progressBar.style.display = 'flex';
+        setDot(-1, '');  // reset all dots
+        dots.forEach(d => d.className = 'progress-dot');
+
+        try {
+            for (let i = 0; i < 3; i++) {
+                setDot(i, 'active');
+                setStatus('Get ready… photo ' + (i + 1) + ' of 3', 'busy');
+
+                await runCountdown(i);
+
+                setStatus('Click!', 'busy');
+                const [url] = await Promise.all([doCapture(), triggerFlash()]);
+
+                // Pre-load image while pause runs
+                const img = loadImage(url);
+                captured.push({ url, img });
+
+                setDot(i, 'done');
+
+                if (i < 2) {
+                    setStatus('Nice! Get ready for the next one…', 'busy');
+                    await sleep(BETWEEN_MS);
+                }
+            }
+
+            setStatus('Creating your strip…', 'busy');
+            await buildAndShowStrip();
+            setStatus('Your strip is ready!');
+
+        } catch (err) {
+            setStatus('Error: ' + err.message, 'warn');
+            console.error(err);
+            progressBar.style.display = 'none';
+            setButtonsIdle();
+        } finally {
+            running = false;
+            countdownOverlay.classList.add('hidden');
+            flashOverlay.classList.remove('active');
+        }
+    }
+
+    // ── Strip generation ──────────────────────────────────────────────────
+    async function buildAndShowStrip() {
+        // Wait for all 3 images to load
+        const imgs = await Promise.all(captured.map(c => c.img));
+
+        // Use the natural dimensions of the first photo
+        const photoW = imgs[0].naturalWidth;
+        const photoH = imgs[0].naturalHeight;
+
+        const canvasW = photoW + STRIP_PAD * 2;
+        const canvasH = photoH * 3 + STRIP_GAP * 2 + STRIP_PAD * 2;
+
+        stripCanvas.width  = canvasW;
+        stripCanvas.height = canvasH;
+
+        const ctx = stripCanvas.getContext('2d');
+
+        // White background
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvasW, canvasH);
+
+        // Draw each photo
+        for (let i = 0; i < 3; i++) {
+            const y = STRIP_PAD + i * (photoH + STRIP_GAP);
+            ctx.drawImage(imgs[i], STRIP_PAD, y, photoW, photoH);
+        }
+
+        // Date label at bottom strip area
+        const now = new Date();
+        stripDate.textContent = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+
+        // Transition: hide preview, show strip
+        previewSection.style.display = 'none';
+        progressBar.style.display    = 'none';
+        stripSection.style.display   = 'flex';
+        setButtonsStrip();
+    }
+
+    // ── Download ──────────────────────────────────────────────────────────
+    function downloadStrip() {
+        const a = document.createElement('a');
+        a.download = 'picstop-strip-' + Date.now() + '.jpg';
+        a.href = stripCanvas.toDataURL('image/jpeg', 0.93);
+        a.click();
+    }
+
+    // ── Restart ───────────────────────────────────────────────────────────
+    function restart() {
+        captured = [];
+        stripSection.style.display   = 'none';
+        previewSection.style.display = '';
+        setButtonsIdle();
+        setStatus('Live — ready to shoot');
+        dots.forEach(d => d.className = 'progress-dot');
+    }
+
+    // ── Single shot (quick capture outside photobooth flow) ───────────────
+    async function captureSingle() {
+        if (running) return;
+        running = true;
+        btnSingle.disabled = true;
+        btnStart.disabled  = true;
+        setStatus('Capturing…', 'busy');
+        try {
+            const [url] = await Promise.all([doCapture(), triggerFlash()]);
+            setStatus('Saved — ' + url.split('/').pop());
+        } catch (err) {
+            setStatus('Error: ' + err.message, 'warn');
+            console.error(err);
+        } finally {
+            running = false;
+            btnSingle.disabled = false;
+            btnStart.disabled  = false;
+        }
+    }
+
+    // ── Toggle feed ───────────────────────────────────────────────────────
+    function toggleFeed() {
         const img = document.getElementById('preview');
-        if (img.src.includes('preview')) {
+        if (img.src.includes('/preview')) {
             img.src = '';
-            img.alt = 'Feed Paused';
+            img.alt = 'Feed paused';
+            btnToggle.textContent = 'Resume Feed';
         } else {
             img.src = '/preview';
-            img.alt = 'Connecting...';
+            img.alt = 'Connecting…';
+            btnToggle.textContent = 'Toggle Feed';
         }
     }
 </script>

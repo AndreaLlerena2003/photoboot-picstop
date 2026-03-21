@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -46,7 +47,11 @@ func (c *CaptureController) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, domainErrToHTTPStatus(err), CapturePhotoViewModel{Error: err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, CapturePhotoViewModel{Success: resp.Success, Path: resp.Path})
+	writeJSON(w, http.StatusOK, CapturePhotoViewModel{
+		Success: resp.Success,
+		Path:    resp.Path,
+		URL:     "/captures/" + filepath.Base(resp.Path),
+	})
 }
 
 // parseTimeout parses the optional timeout_ms query parameter.
@@ -67,6 +72,7 @@ func (c *CaptureController) parseTimeout(r *http.Request) (time.Duration, bool) 
 type CapturePhotoViewModel struct {
 	Success bool   `json:"success,omitempty"`
 	Path    string `json:"path,omitempty"`
+	URL     string `json:"url,omitempty"` // web-accessible URL, e.g. /captures/IMG_1234.JPG
 	Error   string `json:"error,omitempty"`
 }
 

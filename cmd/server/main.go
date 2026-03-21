@@ -33,7 +33,7 @@ func main() {
 	previewUseCase := preview.NewStreamPreviewUseCase(camera)
 
 	// Presentation: server with use cases injected
-	srv := httppkg.NewServer(":"+cfg.Port, captureUseCase, previewUseCase, cfg.DefaultCaptureTimeout())
+	srv := httppkg.NewServer(":"+cfg.Port, captureUseCase, previewUseCase, cfg.DefaultCaptureTimeout(), cfg.CaptureDir)
 	if err := srv.Start(); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}

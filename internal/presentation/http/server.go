@@ -26,6 +26,7 @@ func NewServer(
 	captureUseCase *capture.CapturePhotoUseCase,
 	previewUseCase *preview.StreamPreviewUseCase,
 	defaultCaptureTimeout time.Duration,
+	captureDir string,
 ) *Server {
 	captureCtrl := NewCaptureController(captureUseCase, defaultCaptureTimeout)
 	previewCtrl := NewPreviewController(previewUseCase)
@@ -34,7 +35,10 @@ func NewServer(
 	mux.HandleFunc("/capture", captureCtrl.ServeHTTP)
 	mux.HandleFunc("/preview", previewCtrl.ServeHTTP)
 
-	// Serve the web demo at the root or /index.html
+	// Serve captured photos so the browser can load them for strip generation.
+	mux.Handle("/captures/", http.StripPrefix("/captures/", http.FileServer(http.Dir(captureDir))))
+
+	// Serve the web UI at the root.
 	mux.Handle("/", http.FileServer(http.Dir("web")))
 
 	return &Server{
