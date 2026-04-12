@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 
@@ -9,6 +10,7 @@ import (
 	"photoboot-picstop/internal/application/capture"
 	"photoboot-picstop/internal/application/preview"
 	"photoboot-picstop/internal/infrastructure/canon"
+	"photoboot-picstop/internal/infrastructure/lut"
 	httppkg "photoboot-picstop/internal/presentation/http"
 )
 
@@ -29,12 +31,24 @@ func main() {
 		}
 	}()
 
+	// Infrastructure: LUT filter engine (loads *.cube files from filters/).
+	lutEngine, err := lut.NewEngine("filters")
+	if err != nil {
+		log.Fatalf("failed to initialize LUT engine: %v", err)
+	}
+	log.Printf("LUT engine initialized (%d filter(s) loaded)", len(lutEngine.ListFilters()))
+
+	// Start hot-reload watcher so filter files can be added/removed at runtime.
+	ctx, cancelWatcher := context.WithCancel(context.Background())
+	defer cancelWatcher()
+	lutEngine.StartWatcher(ctx)
+
 	// Application: use cases with ports injected (DIP)
-	captureUseCase := capture.NewCapturePhotoUseCase(camera)
-	previewUseCase := preview.NewStreamPreviewUseCase(camera)
+	captureUseCase := capture.NewCapturePhotoUseCase(camera, lutEngine)
+	previewUseCase := preview.NewStreamPreviewUseCase(camera, lutEngine)
 
 	// Presentation: server with use cases injected
-	srv := httppkg.NewServer(":"+cfg.Port, captureUseCase, previewUseCase, cfg.DefaultCaptureTimeout(), cfg.CaptureDir)
+	srv := httppkg.NewServer(":"+cfg.Port, captureUseCase, previewUseCase, lutEngine, cfg.DefaultCaptureTimeout(), cfg.CaptureDir)
 	if err := srv.Start(); err != nil {
 		// Do NOT use log.Fatalf here — it calls os.Exit which skips all defers,
 		// including camera.Close(), leaving the EDSDK session and camera ref leaked.

@@ -1,7 +1,7 @@
 # System Architecture
 
 This document describes the architecture of the **Photoboot-Picstop** backend, which interfaces with Canon cameras via
-the EDSDK.
+the EDSDK and applies real-time 3D LUT colour filters to both the live preview stream and captured photos.
 
 ## Architecture Overview
 
@@ -13,13 +13,15 @@ graph TD
     User((User))
     HTTP[Presentation Layer: HTTP]
     APP[Application Layer: Use Cases]
-    INFRA[Infrastructure Layer: Canon EDSDK]
+    INFRA_CAM[Infrastructure: Canon EDSDK]
+    INFRA_LUT[Infrastructure: LUT Filter Engine]
     DOMAIN[Domain Layer: Models & Errors]
-    User -->|POST /capture| HTTP
+    User -->|POST /capture\nGET /preview\nGET /filters\nPUT /filter| HTTP
     HTTP --> APP
-    APP --> INFRA
+    APP --> INFRA_CAM
+    APP --> INFRA_LUT
     APP -.-> DOMAIN
-    INFRA -.-> DOMAIN
+    INFRA_CAM -.-> DOMAIN
     HTTP -.-> DOMAIN
 ```
 
@@ -29,11 +31,13 @@ graph TD
   appropriate HTTP status codes. It uses a View Model pattern to decouple internal domain types from external JSON
   responses.
 - **Application**: Contains the business orchestration logic. It defines **ports** (interfaces) like
-  `ICameraCapturePort` that the infrastructure layer must implement. This layer ensures that use cases (e.g.,
-  `CapturePhotoUseCase`) remain agnostic of the underlying camera driver.
-- **Infrastructure (Canon)**: The "heavy lifting" layer. Implements camera control using CGo and the Canon EDSDK. It
-  manages the `ReconnectingService` wrapper, platform-specific threading (COM STA for Windows, RunLoops for macOS), and
-  the callback-driven event pump.
+  `ICameraCapturePort` and `IFilterPort` that the infrastructure layer must implement. This layer ensures that use cases
+  remain agnostic of the underlying camera driver and image processing details.
+- **Infrastructure (Canon)**: The "heavy lifting" layer for camera control. Implements camera commands using CGo and the
+  Canon EDSDK. Manages the `ReconnectingService` wrapper, platform-specific threading (COM STA for Windows), and the
+  callback-driven event pump.
+- **Infrastructure (LUT)**: Pure-Go image processing. Loads Adobe `.cube` files at startup, applies trilinear
+  interpolation per pixel, and hot-reloads the filter catalogue when files are added or removed.
 - **Domain**: Pure Go logic containing value objects and sentinel errors.
     - `CaptureResult`: Value object representing the outcome of a capture.
     - Sentinel Errors: `ErrCaptureInProgress`, `ErrCaptureSuperseded`, `ErrShutterCommandTimeout`,
@@ -51,29 +55,95 @@ classDiagram
         -useCase: CapturePhotoUseCase
         +ServeHTTP(w, r)
     }
+    class FilterController {
+        -port: IFilterPort
+        +ServeList(w, r)
+        +ServeSet(w, r)
+    }
     class CapturePhotoUseCase {
-        -port: ICameraCapturePort
+        -camera: ICameraCapturePort
+        -filter: IFilterPort
+        +Execute(ctx)
+    }
+    class StreamPreviewUseCase {
+        -port: IPreviewPort
+        -filter: IFilterPort
         +Execute(ctx)
     }
     class ICameraCapturePort {
         <<interface>>
         +Capture(ctx)
     }
+    class IFilterPort {
+        <<interface>>
+        +ApplyToFile(ctx, path, name)
+        +WrapPreviewChannel(ctx, ch, name)
+        +ListFilters()
+        +ActiveFilter()
+        +SetActiveFilter(name)
+    }
     class ReconnectingService {
         -inner: Service
         +reconnectLoop()
     }
-    class Service {
-        -camera: EdsCameraRef
-        -eventPump: goroutine
-        +Capture(ctx)
+    class Engine {
+        -registry: registry
+        -activeFilter: atomic.Value
+        +StartWatcher(ctx)
     }
 
     CaptureController --> CapturePhotoUseCase
+    FilterController --> IFilterPort
     CapturePhotoUseCase --> ICameraCapturePort
+    CapturePhotoUseCase --> IFilterPort
+    StreamPreviewUseCase --> IFilterPort
     ICameraCapturePort <|.. ReconnectingService
-    ReconnectingService *-- Service
+    IFilterPort <|.. Engine
 ```
+
+---
+
+## Filter Pipeline
+
+### Overview
+
+The filter pipeline slots between the application use cases and the HTTP presentation layer without touching the Canon
+infrastructure. The key design decisions:
+
+- **`nil` filter port = passthrough** — use cases accept `nil`; no feature flag needed.
+- **Filter failure is non-fatal on capture** — if `ApplyToFile` fails, the original photo is still returned.
+- **Original is never modified** — `ApplyToFile` writes `IMG_1234_filtered.JPG` alongside `IMG_1234.JPG`.
+- **Active filter in `atomic.Value`** — preview goroutine reads it per frame; filter changes take effect on the next
+  frame with no stream interruption or restart.
+
+### 3D LUT Interpolation
+
+Each pixel is mapped through the LUT using **trilinear interpolation** across the 8 nearest table vertices.
+For a LUT of size N, the interpolation is:
+
+```
+floor(R*(N-1)) → r0,  frac → dr
+floor(G*(N-1)) → g0,  frac → dg
+floor(B*(N-1)) → b0,  frac → db
+
+output = trilinear(corner_000..corner_111, dr, dg, db)
+```
+
+The bundled LUTs use **17×17×17** (4913 entries), which balances quality and file size. Standard `.cube` files at any
+size from 2 to 256 are accepted.
+
+### Hot-Reload
+
+The `registry` polls the `filters/` directory every 5 seconds. New `.cube` files are loaded; deleted files are
+unloaded. If the active filter is removed while the service is running, subsequent frames pass through unfiltered
+automatically (the `registry.get` lookup returns `(nil, false)` and the goroutine passes the raw frame).
+
+### Performance
+
+| Path | Strategy |
+|---|---|
+| Preview (15–30 ms/frame) | Single goroutine per stream; `sync.Pool` recycles `image.NRGBA` buffers; JPEG quality 85 |
+| Capture (full-res JPEG) | Row-striped across `GOMAXPROCS` goroutines; JPEG quality 95 |
 
 ---
 
@@ -135,12 +205,12 @@ graph LR
     T1 -- Go Channels --> G3
 ```
 
-### 2. Event Pump
+### 3. Event Pump
 
 The EDSDK is event-driven for object creation (files) and state changes (disconnects). A dedicated event pump goroutine
 runs `EdsGetEvent()` in a loop to ensure these callbacks are processed.
 
-### 3. Live Preview (EVF) Logic
+### 4. Live Preview (EVF) Logic
 
 The system provides a real-time MJPEG stream by periodically grabbing frames from the camera's Electronic Viewfinder (
 EVF).
@@ -149,16 +219,19 @@ EVF).
   context.
 - **Frame Grabbing**: It uses `EdsDownloadEvfImage` to pull JPEG data into a memory stream, which is then broadcast to
   connected HTTP clients via Go channels.
+- **Filter Wrapping**: If a filter is active, `StreamPreviewUseCase` wraps the raw frame channel with
+  `IFilterPort.WrapPreviewChannel`. The wrapping goroutine reads `ActiveFilter()` atomically on every frame, so filter
+  changes take effect immediately without restarting the EVF.
 - **State Management**:
     - **Active**: The loop is running and fetching frames.
     - **Suspended**: The loop is temporarily stopped to yield camera control to a capture operation. The HTTP stream
       remains open, but frames are paused.
     - **Stopped**: The loop is terminated because no clients are listening.
 
-### 4. EVF / Capture Synchronization
+### 5. EVF / Capture Synchronisation
 
 Capturing a photo and running the EVF are mutually exclusive operations for the EDSDK on many camera models. To ensure
-reliability, the system implements a strict synchronization protocol:
+reliability, the system implements a strict synchronisation protocol:
 
 1. **Pre-Capture Suspension**: Before firing the shutter, the `Capture` use case triggers `suspendEVF()`. This
    gracefully stops the `evfLoop` and tells the camera to disable EVF output.
@@ -180,7 +253,7 @@ stateDiagram-v2
     Suspended --> Off: StopPreview / Disconnect
 ```
 
-### 5. Command Serialization & Busy Policy
+### 6. Command Serialization & Busy Policy
 
 The Canon EDSDK is **not thread-safe** for simultaneous commands on the same `EdsCameraRef`. Attempting to fire two
 commands at once will almost always result in a `EDS_ERR_DEVICE_BUSY` error from the hardware.
@@ -189,15 +262,15 @@ The system handles this through:
 
 - **Mutex Protection**: A `sync.Mutex` guards the internal state of the `Service`, ensuring only one goroutine can
   initiate a capture or property change at a time.
-- **EVF Preemption**: As established in the synchronization protocol, the EVF loop (which constantly calls the SDK) is *
-  *suspended** during capture to ensure the SDK channel is clear for the shutter command.
+- **EVF Preemption**: As established in the synchronisation protocol, the EVF loop (which constantly calls the SDK) is
+  **suspended** during capture to ensure the SDK channel is clear for the shutter command.
 - **Queueing (Implicit)**: While we don't have a broad work queue, the `Capture` method manages a `pending` request
   slot. A newer capture request will **preempt** an older one that hasn't started yet, ensuring the camera isn't
   overwhelmed with conflicting shutter signals.
 
-### 6. Capture Request Preemption
+### 7. Capture Request Preemption
 
-When multiple photo commands are sent in rapid succession, the system prioritizes the **latest** request to ensure the
+When multiple photo commands are sent in rapid succession, the system prioritises the **latest** request to ensure the
 user receives the most recent intent and the camera is not overwhelmed.
 
 - **Superseding**: If a request arrives while another is waiting for its file download, the older request is immediately
@@ -234,15 +307,16 @@ sequenceDiagram
 
 ## Sequence Flows
 
-### Photo Capture Flow
+### Photo Capture Flow (with Filter)
 
-This diagram illustrates the end-to-end flow of a capture request, including the internal suspension of the EVF.
+This diagram illustrates the end-to-end flow of a capture request, including EVF suspension and optional filter application.
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant H as CaptureController
     participant U as CapturePhotoUseCase
+    participant F as LUT Engine (IFilterPort)
     participant S as Canon Service
     participant E as EVF Loop
     participant CAM as Camera (EDSDK)
@@ -258,9 +332,13 @@ sequenceDiagram
     S ->> CAM: EdsDownload
     CAM -->> S: File Data
     S ->> E: Resume EVF
-    S -->> U: File Path
-    U -->> H: DTO
-    H -->> C: JSON response
+    S -->> U: original path
+    alt filter active
+        U ->> F: ApplyToFile(ctx, path, filterName)
+        F -->> U: filtered path
+    end
+    U -->> H: DTO {OriginalPath, FilteredPath}
+    H -->> C: JSON {original_url, filtered_url?}
 ```
 
 ### Camera Reconnection Flow
@@ -290,7 +368,7 @@ sequenceDiagram
 
 ## Configuration & API
 
-The system is configured via environment variables. These settings tune the timing and behavior of the EDSDK interface.
+The system is configured via environment variables. These settings tune the timing and behaviour of the EDSDK interface.
 Detailed API specifications can be found in the [openapi.yaml](./openapi.yaml) file.
 
 | Variable                           | Default    | Description                                  |
@@ -303,6 +381,9 @@ Detailed API specifications can be found in the [openapi.yaml](./openapi.yaml) f
 | `CANON_JOB_DRAIN_TIMEOUT_MS`       | `4000`     | Wait time for previous camera jobs to finish |
 | `CANON_CAPTURE_PREEMPT_MS`         | `1200`     | Delay after preempting an in-flight capture  |
 
+Filters are configured by placing `.cube` files in the `filters/` directory (no env var needed). The engine
+hot-reloads every 5 seconds.
+
 ---
 
 ## Build & Environment
@@ -314,3 +395,4 @@ This project is a cross-platform Go application supporting **Windows** and **mac
 - **CGo**: Must be enabled (`CGO_ENABLED=1`).
 - **Binaries (Windows)**: `edsdk/EDSDK.dll` and `edsdk/EDSDK.lib` must be present.
 - **Framework (macOS)**: `EDSDK.framework` must be present in the `libs` directory for linking.
+- **Filters**: Place any Adobe `.cube` LUT files in `filters/`. Two presets (`identity`, `warm`) are included.

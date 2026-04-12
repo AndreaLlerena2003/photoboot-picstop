@@ -2,9 +2,10 @@ openapi: 3.0.3
 info:
   title: Photoboot-Picstop API
   description: |
-    API for controlling a Canon camera to capture photos and stream live preview.
+    API for controlling a Canon camera to capture photos, stream live preview, and apply
+    real-time 3D LUT colour filters.
     Note: This API interacts with physical hardware and requires a Windows environment with the Canon EDSDK.
-  version: 1.0.0
+  version: 2.0.0
 servers:
   - url: http://localhost:8080
     description: Local development server
@@ -14,8 +15,8 @@ paths:
     get:
       summary: Web Demo Interface
       description: |
-        Serves the static HTML/CSS/JS demo interface from the `web/` directory. 
-        Provides a ready-to-use GUI for live preview and camera control.
+        Serves the static HTML/CSS/JS demo interface from the `web/` directory.
+        Provides a ready-to-use GUI for live preview, filter selection, and camera control.
       responses:
         '200':
           description: OK. Returns the index.html file.
@@ -28,13 +29,15 @@ paths:
     post:
       summary: Capture a photo
       description: |
-        Triggers the camera shutter to take a photo. The request blocks until the photo is captured and transferred 
-        to the host machine. 
-        
-        **Concurrency Behavior**:
-        - If a second capture request arrives while the first is in progress, the first request is **superseded** 
-          (canceled with a 409 Conflict) and the newer request takes priority.
-        - The EVF (preview) is automatically suspended during this operation.
+        Triggers the camera shutter to take a photo. The request blocks until the photo is captured.
+        If a filter is active (set via `PUT /filter`), a filtered copy is also produced and its URL
+        is returned in `filtered_url`. Filter failure is **non-fatal** — the original photo is always
+        returned even if the filter step fails.
+
+        **Concurrency Behaviour**:
+        - If a second capture request arrives while the first is in progress, the first is **superseded**
+          (canceled with 409 Conflict) and the newer request takes priority.
+        - The EVF (preview) is automatically suspended during capture.
       parameters:
         - name: timeout_ms
           in: query
@@ -52,6 +55,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CaptureResponse'
+              examples:
+                no_filter:
+                  summary: Capture without a filter active
+                  value:
+                    success: true
+                    original_url: /captures/IMG_0001.JPG
+                with_filter:
+                  summary: Capture with the "warm" filter active
+                  value:
+                    success: true
+                    original_url: /captures/IMG_0001.JPG
+                    filtered_url: /captures/IMG_0001_filtered.JPG
         '400':
           description: Invalid timeout_ms parameter.
           content:
@@ -64,20 +79,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-        '409':
-          description: Conflict. The capture was superseded by a newer request.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
         '408':
           description: Request timeout (context canceled).
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-        '504':
-          description: Gateway timeout (shutter command or transfer timeout).
+        '409':
+          description: Conflict. The capture was superseded by a newer request.
           content:
             application/json:
               schema:
@@ -88,17 +97,26 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '504':
+          description: Gateway timeout (shutter command or transfer timeout).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /preview:
     get:
       summary: Stream live preview
       description: |
-        Streams MJPEG frames from the camera's Electronic Viewfinder (EVF). 
-        This endpoint uses `multipart/x-mixed-replace` to push JPEG frames to the client continuously.
-        
-        **Browser Compatibility**:
-        Natively supported by all modern browsers. Use directly as the source for an image tag:
-        `<img src="/preview" alt="Live View">`.
+        Streams MJPEG frames from the camera's Electronic Viewfinder (EVF).
+        Uses `multipart/x-mixed-replace` to push JPEG frames continuously.
+
+        If a filter is currently active (set via `PUT /filter`), each frame is processed
+        through the 3D LUT before being sent. Filter changes take effect on the next frame
+        without interrupting the stream.
+
+        **Browser Compatibility**: Natively supported by all modern browsers.
+        Use directly as the source for an image tag: `<img src="/preview">`.
       responses:
         '200':
           description: Successfully started MJPEG stream.
@@ -120,6 +138,79 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /filters:
+    get:
+      summary: List available filters
+      description: |
+        Returns a sorted JSON array of filter names loaded from the `filters/` directory.
+        The list is updated automatically when `.cube` files are added or removed (hot-reload
+        polling every 5 seconds). Returns an empty array when no `.cube` files are present.
+      responses:
+        '200':
+          description: Array of available filter names.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FilterList'
+              example: ["identity", "warm"]
+        '405':
+          description: Method not allowed. Use GET.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /filter:
+    put:
+      summary: Set the active filter
+      description: |
+        Sets the filter that will be applied to subsequent captures and preview frames.
+        Send `name: ""` to clear the active filter (passthrough mode).
+
+        The change takes effect immediately:
+        - **Preview**: applied on the next frame (no stream interruption).
+        - **Capture**: applied to the next `POST /capture` request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetFilterRequest'
+            examples:
+              set_warm:
+                summary: Activate the "warm" filter
+                value:
+                  name: warm
+              clear:
+                summary: Clear the active filter
+                value:
+                  name: ""
+      responses:
+        '200':
+          description: Filter set successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SetFilterResponse'
+        '400':
+          description: Malformed JSON body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: The requested filter name does not exist.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '405':
+          description: Method not allowed. Use PUT.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
 components:
   schemas:
     CaptureResponse:
@@ -128,13 +219,45 @@ components:
         success:
           type: boolean
           example: true
-        path:
+        original_url:
           type: string
-          description: Absolute path to the saved photo on the host machine.
-          example: "C:\\Users\\arllk\\code\\photoboot-picstop\\captures\\IMG_0001.JPG"
+          description: Web-accessible URL for the original (unfiltered) photo.
+          example: /captures/IMG_0001.JPG
+        filtered_url:
+          type: string
+          description: |
+            Web-accessible URL for the filtered copy. Only present when a filter was
+            active at capture time and the filter step succeeded.
+          example: /captures/IMG_0001_filtered.JPG
+
+    FilterList:
+      type: array
+      items:
+        type: string
+      description: Sorted list of available filter names (stems of .cube files in filters/).
+      example: ["identity", "warm"]
+
+    SetFilterRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Filter name to activate. Pass "" to clear the active filter.
+          example: warm
+
+    SetFilterResponse:
+      type: object
+      properties:
+        active:
+          type: string
+          description: The name of the now-active filter ("" means no filter).
+          example: warm
+
     ErrorResponse:
       type: object
       properties:
         error:
           type: string
-          example: "capture in progress"
+          example: "filter \"vivid\" not found"

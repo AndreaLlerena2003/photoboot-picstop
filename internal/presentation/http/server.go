@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"photoboot-picstop/internal/application/capture"
+	"photoboot-picstop/internal/application/filter"
 	"photoboot-picstop/internal/application/preview"
 )
 
@@ -20,20 +21,24 @@ type Server struct {
 	srv *http.Server
 }
 
-// NewServer builds the server with capture and preview routes (dependencies injected).
+// NewServer builds the server with capture, preview, and filter routes (dependencies injected).
 func NewServer(
 	addr string,
 	captureUseCase *capture.CapturePhotoUseCase,
 	previewUseCase *preview.StreamPreviewUseCase,
+	filterPort filter.IFilterPort,
 	defaultCaptureTimeout time.Duration,
 	captureDir string,
 ) *Server {
 	captureCtrl := NewCaptureController(captureUseCase, defaultCaptureTimeout)
 	previewCtrl := NewPreviewController(previewUseCase)
+	filterCtrl := NewFilterController(filterPort)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/capture", captureCtrl.ServeHTTP)
 	mux.HandleFunc("/preview", previewCtrl.ServeHTTP)
+	mux.HandleFunc("/filters", filterCtrl.ServeList)
+	mux.HandleFunc("/filter", filterCtrl.ServeSet)
 
 	// Serve captured photos so the browser can load them for strip generation.
 	mux.Handle("/captures/", http.StripPrefix("/captures/", http.FileServer(http.Dir(captureDir))))

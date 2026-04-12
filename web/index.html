@@ -188,6 +188,54 @@
             text-transform: uppercase;
         }
 
+        /* ── Filter bar ── */
+        .filter-section {
+            margin-top: 1rem;
+        }
+
+        .filter-label {
+            font-size: 0.7rem;
+            font-weight: 600;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--muted);
+            margin-bottom: 0.45rem;
+        }
+
+        .filter-bar {
+            display: flex;
+            gap: 0.45rem;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .filter-chip {
+            padding: 0.3rem 0.85rem;
+            border-radius: 20px;
+            border: 1px solid rgba(255,255,255,0.18);
+            background: transparent;
+            color: var(--muted);
+            font-family: inherit;
+            font-size: 0.78rem;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .filter-chip:hover {
+            background: rgba(255,255,255,0.07);
+            color: var(--text);
+            border-color: rgba(255,255,255,0.35);
+        }
+
+        .filter-chip.active {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: #fff;
+            box-shadow: 0 0 12px rgba(79,172,238,0.35);
+        }
+
         /* ── Controls ── */
         .controls {
             margin-top: 1.5rem;
@@ -294,6 +342,14 @@
         <div class="strip-frame">
             <canvas id="strip-canvas"></canvas>
             <div class="strip-label">Picstop&nbsp;&nbsp;·&nbsp;&nbsp;<span id="strip-date"></span></div>
+        </div>
+    </div>
+
+    <!-- Filter selector -->
+    <div class="filter-section" id="filter-section">
+        <div class="filter-label">Filter</div>
+        <div class="filter-bar" id="filter-bar">
+            <!-- populated by loadFilters() -->
         </div>
     </div>
 
@@ -427,10 +483,11 @@
     async function doCapture() {
         const resp = await fetch('/capture', { method: 'POST' });
         const data = await resp.json();
-        if (!resp.ok || !data.url) {
+        if (!resp.ok || !data.original_url) {
             throw new Error(data.error || 'Capture failed (HTTP ' + resp.status + ')');
         }
-        return data.url;
+        // Prefer filtered image for the strip if a filter is active.
+        return data.filtered_url || data.original_url;
     }
 
     // ── Photobooth flow ───────────────────────────────────────────────────
@@ -559,6 +616,56 @@
             btnStart.disabled  = false;
         }
     }
+
+    // ── Filter picker ─────────────────────────────────────────────────────
+    let activeFilter = '';
+
+    async function loadFilters() {
+        try {
+            const resp = await fetch('/filters');
+            if (!resp.ok) return;
+            const names = await resp.json();
+            renderFilterBar(names);
+        } catch (e) {
+            console.warn('Could not load filters:', e);
+        }
+    }
+
+    function renderFilterBar(names) {
+        const bar = document.getElementById('filter-bar');
+        bar.innerHTML = '';
+        ['', ...names].forEach(name => {
+            const btn = document.createElement('button');
+            btn.className = 'filter-chip' + (name === activeFilter ? ' active' : '');
+            btn.dataset.name = name;
+            btn.textContent = name === '' ? 'No Filter' : name.charAt(0).toUpperCase() + name.slice(1);
+            btn.onclick = () => selectFilter(name);
+            bar.appendChild(btn);
+        });
+    }
+
+    async function selectFilter(name) {
+        try {
+            const resp = await fetch('/filter', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name })
+            });
+            if (!resp.ok) {
+                const data = await resp.json().catch(() => ({}));
+                setStatus('Filter error: ' + (data.error || resp.status), 'warn');
+                return;
+            }
+            activeFilter = name;
+            document.querySelectorAll('.filter-chip').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.name === name);
+            });
+        } catch (e) {
+            console.warn('Could not set filter:', e);
+        }
+    }
+
+    loadFilters();
 
     // ── Toggle feed ───────────────────────────────────────────────────────
     function toggleFeed() {

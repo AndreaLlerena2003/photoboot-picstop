@@ -47,11 +47,15 @@ func (c *CaptureController) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, domainErrToHTTPStatus(err), CapturePhotoViewModel{Error: err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, CapturePhotoViewModel{
-		Success: resp.Success,
-		Path:    resp.Path,
-		URL:     "/captures/" + filepath.Base(resp.Path),
-	})
+
+	vm := CapturePhotoViewModel{
+		Success:     resp.Success,
+		OriginalURL: "/captures/" + filepath.Base(resp.OriginalPath),
+	}
+	if resp.FilteredPath != "" {
+		vm.FilteredURL = "/captures/" + filepath.Base(resp.FilteredPath)
+	}
+	writeJSON(w, http.StatusOK, vm)
 }
 
 // parseTimeout parses the optional timeout_ms query parameter.
@@ -70,10 +74,10 @@ func (c *CaptureController) parseTimeout(r *http.Request) (time.Duration, bool) 
 
 // CapturePhotoViewModel is the JSON view model for capture responses (presentation layer).
 type CapturePhotoViewModel struct {
-	Success bool   `json:"success,omitempty"`
-	Path    string `json:"path,omitempty"`
-	URL     string `json:"url,omitempty"` // web-accessible URL, e.g. /captures/IMG_1234.JPG
-	Error   string `json:"error,omitempty"`
+	Success     bool   `json:"success,omitempty"`
+	OriginalURL string `json:"original_url,omitempty"` // web-accessible URL for the original photo
+	FilteredURL string `json:"filtered_url,omitempty"` // web-accessible URL for the filtered photo (if any)
+	Error       string `json:"error,omitempty"`
 }
 
 // domainErrToHTTPStatus maps domain/context errors to HTTP status codes (presentation concern).

@@ -3,7 +3,8 @@
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey)](https://www.apple.com/macos)
 
 A high-performance backend service for Canon camera control, designed for photobooth applications. This service provides
-a RESTful API to capture photos and a real-time MJPEG stream for live preview, using the **Canon EDSDK**.
+a RESTful API to capture photos, a real-time MJPEG stream for live preview, and a **3D LUT filter pipeline** that applies
+colour grading to both the preview stream and captured photos — all using the **Canon EDSDK**.
 
 ---
 
@@ -11,9 +12,10 @@ a RESTful API to capture photos and a real-time MJPEG stream for live preview, u
 
 - **📸 Instant Capture**: Trigger photo capture via HTTP POST with configurable timeouts.
 - **🎥 Live Preview**: High-speed MJPEG stream (Electronic Viewfinder - EVF) compatible with standard `<img>` tags.
+- **🎨 Real-Time Filters**: 3D LUT colour grading applied to both the live preview and captured photos. Drop any `.cube` file into `filters/` — no restart needed.
 - **🔄 Auto-Reconnection**: Seamlessly handles camera disconnections and reconnections without service restarts.
 - **🏗️ Clean Architecture**: Decoupled domain logic and infrastructure, making the codebase maintainable and testable.
-- **⚡ Performance-First**: Uses optimized CGo bindings for direct communication with the Canon EDSDK.
+- **⚡ Performance-First**: Uses optimised CGo bindings for direct communication with the Canon EDSDK. LUT applied with parallel row-striping on capture; pooled buffers on preview.
 
 ---
 
@@ -53,27 +55,34 @@ PORT=8080
 CAPTURE_DIR=captures
 ```
 
-### 2. Build
+### 2. Add Filters (optional)
+
+Place any Adobe `.cube` LUT files into the `filters/` directory. Two presets are included:
+
+| File | Effect |
+|---|---|
+| `filters/identity.cube` | Pass-through (no change) |
+| `filters/warm.cube` | Warm tone — boosted reds, lifted shadows, reduced blues |
+
+The engine hot-reloads every 5 seconds, so you can add or remove filter files while the server is running.
+
+### 3. Build
 
 #### Windows
 
 ```powershell
-# Set CGo environment variables
 $env:CGO_ENABLED="1"
 $env:GOARCH="amd64"
-
-# Build the server
 go build -o server.exe ./cmd/server/...
 ```
 
 #### macOS
 
 ```bash
-# Build the server
 CGO_ENABLED=1 go build -o server ./cmd/server/...
 ```
 
-### 3. Run
+### 4. Run
 
 ```powershell
 ./server.exe
@@ -81,42 +90,40 @@ CGO_ENABLED=1 go build -o server ./cmd/server/...
 
 ---
 
-## 🌐 Web Integration
+## 🌐 Web Interface
 
-The live preview is streamed using **MJPEG (Multipart JPEG)**, which is natively supported by all modern browsers. You
-can embed the camera feed directly into your frontend with a single line of HTML:
+The bundled web UI at [http://localhost:8080/](http://localhost:8080/) provides:
+
+- **Live camera preview** via MJPEG.
+- **Filter picker** — a chip-style selector that lists all loaded `.cube` presets; selecting one updates the preview and all subsequent captures instantly.
+- **Photobooth flow** — 3-shot countdown with automatic strip generation.
+- **Single capture** mode.
+- **Strip download** as JPEG.
+
+Embed the live preview in any frontend:
 
 ```html
-<!-- Simple live preview implementation -->
 <img src="http://localhost:8080/preview" alt="Camera Feed">
 ```
-
-### Premium Demo
-
-A complete, styled web interface is provided in [web/index.html](./web/index.html). Since the server now supports static
-file serving, you can access this demo directly at:
-
-- **URL**: [http://localhost:8080/](http://localhost:8080/)
 
 ---
 
 ## 📡 API Reference
 
-The server exposes two primary endpoints:
+| Endpoint   | Method | Description                                            |
+|------------|--------|--------------------------------------------------------|
+| `/capture` | POST   | Trigger capture. Returns `original_url` (+ `filtered_url` if a filter is active). |
+| `/preview` | GET    | MJPEG live-view stream. Frames are filtered in real-time if a filter is active. |
+| `/filters` | GET    | List available filter names (loaded from `filters/*.cube`). |
+| `/filter`  | PUT    | Set or clear the active filter (`{"name": "warm"}` or `{"name": ""}`). |
 
-| Endpoint   | Method | Description                                      |
-|------------|--------|--------------------------------------------------|
-| `/capture` | `POST` | Triggers a photo capture. Returns JSON metadata. |
-| `/preview` | `GET`  | Starts an MJPEG live view stream.                |
-
-For detailed API specifications, view the [OpenAPI 3.0 Documentation](./openapi.yaml).
+For full request/response schemas see the [OpenAPI 3.0 specification](./openapi.yaml).
 
 ---
 
 ## 📘 Documentation
 
-- **[Architecture Guide](./ARCHITECTURE.md)**: Deep dive into the system design, sequence flows, and EDSDK
-  technicalities.
+- **[Architecture Guide](./ARCHITECTURE.md)**: Deep dive into system design, the filter pipeline, sequence flows, and EDSDK technicalities.
 - **[API Specification](./openapi.yaml)**: Full OpenAPI 3.0 YAML with all request/response schemas.
 
 ---
