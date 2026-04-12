@@ -3,6 +3,7 @@ package main
 
 import (
 	"log"
+	"os"
 
 	"photoboot-picstop/config"
 	"photoboot-picstop/internal/application/capture"
@@ -35,6 +36,12 @@ func main() {
 	// Presentation: server with use cases injected
 	srv := httppkg.NewServer(":"+cfg.Port, captureUseCase, previewUseCase, cfg.DefaultCaptureTimeout(), cfg.CaptureDir)
 	if err := srv.Start(); err != nil {
-		log.Fatalf("server failed: %v", err)
+		// Do NOT use log.Fatalf here — it calls os.Exit which skips all defers,
+		// including camera.Close(), leaving the EDSDK session and camera ref leaked.
+		log.Printf("server error: %v", err)
+		if closeErr := camera.Close(); closeErr != nil {
+			log.Printf("camera close during error exit: %v", closeErr)
+		}
+		os.Exit(1)
 	}
 }
